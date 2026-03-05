@@ -77,6 +77,11 @@ class PredictionEngine:
             print(f"  Veri: {len(df)} kayit, {df['product_id'].nunique()} urun")
             print()
 
+        # date kolonu: string veya datetime olabilir — normalize et
+        df = df.copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
         # Katman 2: Z-Score
         if verbose:
             print("[Katman 2] Z-Score veri temizleme")

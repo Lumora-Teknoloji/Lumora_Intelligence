@@ -214,19 +214,49 @@ class FeatureEngineer:
 
     def _add_size_depletion(self, df: pd.DataFrame) -> pd.DataFrame:
         """Beden tükenme hızı — güçlü talep sinyali."""
+        # Tercih 1: total_stock integer kolonu (v3 sample_data)
+        if "total_stock" in df.columns:
+            stock_col = pd.to_numeric(df["total_stock"], errors="coerce").fillna(0)
+            first_stock = df.groupby("product_id")["total_stock"].transform(
+                lambda x: pd.to_numeric(x, errors="coerce").fillna(0).iloc[0]
+            )
+            df["size_depletion_rate"] = (
+                (first_stock - stock_col) / (first_stock + 1e-6)
+            ).clip(0, 1)
+            df["rapid_size_depletion"] = (df["size_depletion_rate"] > 0.3).astype(int)
+            df["size_change_velocity"] = df.groupby("product_id")["total_stock"].transform(
+                lambda x: pd.to_numeric(x, errors="coerce").fillna(0).diff().fillna(0)
+            )
+            return df
+
+        # Tercih 2: available_sizes JSON string (eski format — sayısal ise)
         if "available_sizes" not in df.columns:
             return df
 
-        # İlk gün → bugün kaç beden azalmış
-        df["size_depletion_rate"] = df.groupby("product_id")["available_sizes"].transform(
-            lambda x: (x.iloc[0] - x) / (x.iloc[0] + 1e-6)
-        )
-        # Hızlı tükenme flag'i (>%30 tükenmiş)
-        df["rapid_size_depletion"] = (df["size_depletion_rate"] > 0.3).astype(int)
+        def safe_total(val):
+            if isinstance(val, (int, float)):
+                return float(val)
+            if isinstance(val, str):
+                import json
+                try:
+                    d = json.loads(val)
+                    if isinstance(d, dict):
+                        return float(sum(d.values()))
+                    return float(val)
+                except Exception:
+                    return 0.0
+            return 0.0
 
-        # Beden değişim hızı (günlük)
+        stock_series = df["available_sizes"].apply(safe_total)
+        first_stock = df.groupby("product_id")["available_sizes"].transform(
+            lambda x: x.apply(safe_total).iloc[0]
+        )
+        df["size_depletion_rate"] = (
+            (first_stock - stock_series) / (first_stock + 1e-6)
+        ).clip(0, 1)
+        df["rapid_size_depletion"] = (df["size_depletion_rate"] > 0.3).astype(int)
         df["size_change_velocity"] = df.groupby("product_id")["available_sizes"].transform(
-            lambda x: x.diff().fillna(0)
+            lambda x: x.apply(safe_total).diff().fillna(0)
         )
 
         return df
