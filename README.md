@@ -5,6 +5,7 @@
   <img src="https://img.shields.io/badge/CatBoost-Ensemble-brightgreen" />
   <img src="https://img.shields.io/badge/Kalman-Online%20Learning-orange" />
   <img src="https://img.shields.io/badge/Trendyol-Native-red" />
+  <img src="https://img.shields.io/badge/Simulation-44%20kolonlu-purple" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey" />
 </p>
 
@@ -31,7 +32,7 @@ Bir hafta sonra                      →  Sahte trendler listeden düştü
 │  Katman 3  │  CatBoost (composite demand skoru)     │
 │  Katman 4  │  Kalman Filtresi (online güncelleme)   │
 │  Katman 5  │  Ensemble Layer (ağırlıklı birleştirme)│
-│  Katman 6  │  Feedback Loop (sahte trend öğrenimi) │
+│  Katman 6  │  Feedback Loop (sahte trend öğrenimi)  │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -43,7 +44,12 @@ Bir hafta sonra                      →  Sahte trendler listeden düştü
 git clone https://github.com/Lumora-Teknoloji/Lumora_Intelligence.git
 cd Lumora_Intelligence
 pip install -r requirements.txt
-python run_test.py
+
+# 5 senaryo testi çalıştır
+python run_scenarios.py
+
+# Tek kategori trend analizi
+python show_trend_abiye.py
 ```
 
 ---
@@ -66,7 +72,7 @@ print(top5[["product_id", "trend_label", "trend_score", "confidence"]])
 engine.feedback_top_n({
     pid_A: 45,   # iyi sattı → sistem güvenir
     pid_B: 2,    # az sattı → SAHTE TREND → ceza ×0.35
-    pid_C: 30,   # iyi sattı
+    pid_C: 30,
 })
 
 # 4. Toplu feedback (etiket bazlı)
@@ -78,17 +84,18 @@ engine.feedback_batch({
 
 ---
 
-## 📊 Test Sonuçları
+## 📊 Test Sonuçları (v2)
 
-| Senaryo | Yükseliş Tespiti | Notlar |
-|---------|-----------------|--------|
-| Karma Kategoriler | ⚠️ %51.7 | Baseline |
-| Sezonsal Pik | ⚠️ %59.6 | Kış→İlkbahar geçişi |
-| Soğuk Başlangıç | ✅ %77.4 | Yeni kategoriye adaptasyon |
-| Fiyat Baskısı | ⚠️ %44.4 | Enflasyon etkisi |
-| Rakip + Viral | ✅ %70.8 | Viral ürün tespiti |
+| Senaryo | Yükseliş Tespiti | Skor Gap |
+|---------|-----------------|----------|
+| Karma Kategoriler (Baseline) | ✅ %60.0 | +0.4 |
+| Sezonsal Pik (Kış Başlangıcı) | ⚠️ %52.3 | +4.8 |
+| Soğuk Başlangıç (Yeni Kategori) | ✅ %71.0 | — |
+| Fiyat/Enflasyon Baskısı | ⚠️ %56.2 | +1.5 |
+| Rakip Çatışması + Viral Ürün | ✅ %65.4 | — |
 
-> ⚠️ Sonuçlar simüle veri üzerindendir. Gerçek Trendyol verisi ile kalibre edildikten sonra %65-75+ doğruluk beklenmektedir.
+> ✅ Baseline %60 eşiğini ilk kez v2'de geçti — growth-rate priority scoring ve stok sinyalleri ile.
+> ⚠️ Sonuçlar simüle veri üzerindendir. Gerçek Trendyol verisi ile %70+ doğruluk beklenmektedir.
 
 ---
 
@@ -98,29 +105,42 @@ engine.feedback_batch({
 Lumora_Intelligence/
 ├── engine/
 │   ├── predictor.py        # Ana motor (train + predict + feedback)
-│   ├── features.py         # Feature mühendisliği (40+ özellik)
-│   └── ...
+│   └── features.py         # Feature mühendisliği (40+ özellik)
 ├── algorithms/
 │   ├── catboost_model.py   # CatBoost ensemble
 │   ├── kalman_filter.py    # Online öğrenme
-│   ├── zscore_detector.py  # Anomali tespiti
-│   └── ...
+│   └── zscore.py           # Anomali tespiti
 ├── data/
-│   ├── sample_data.py      # Gerçekçi simülasyon verisi
+│   ├── sample_data.py      # Gerçekçi simülasyon verisi (v3, 44 kolon)
+│   ├── scenarios.py        # 5 test senaryosu
 │   └── yearly_simulation.py
-├── run_test.py             # Temel test
-├── run_scenarios.py        # 5 senaryo karşılaştırma
-├── run_yearly_persistent.py # 1 yıllık kalıcı öğrenme testi
+├── run_scenarios.py        # 5 senaryo karşılaştırma testi
+├── run_yearly_persistent.py# 1 yıllık kalıcı öğrenme testi
+├── show_trend_abiye.py     # Kategori bazlı trend analizi demo
 ├── demo_gercek_kullanim.py # Top-5 + feedback demo
-├── requirements.txt
-└── README.md
+└── requirements.txt
 ```
 
 ---
 
-## 🔧 Özellikler
+## 📦 Simülasyon Verisi (v3 — 44 Kolon)
 
-### Trend Etiketleri
+`data/sample_data.py` gerçek Trendyol veritabanı yapısını yüksek doğrulukla simüle eder:
+
+| Özellik | Detay |
+|---------|-------|
+| **Kategoriler** | crop, tayt, kadın abiye, mont, kazak, elbise, spor giyim, grup |
+| **JSONB Attributes** | Her kategori için 10-14 spesifik key (bel yüksekliği, etek boyu, teknoloji...) |
+| **Beden/Stok** | `available_sizes`, `total_stock`, `stock_depth` beden bazlı stok takibi |
+| **Özel Gün Takvimi** | Sevgililer, Anneler Günü, Black Friday (11.11), Yılbaşı boost |
+| **Sezon Faktörü** | Off-season ürün %2-10'a düşer (mont yazın, crop kışın) |
+| **Pareto Dağılımı** | Gerçek uzun kuyruk favori dağılımı (%20 ürün %80 favori) |
+| **Gerçek Doluluk** | DB'den alınan oranlar: cart %3-27, view %5-58, fav %55-93 |
+
+---
+
+## 🔧 Trend Etiketleri
+
 | Etiket | Anlam |
 |--------|-------|
 | `TREND` | Yükselen, üretilmeli |
@@ -128,29 +148,17 @@ Lumora_Intelligence/
 | `STABIL` | Sabit talep |
 | `DUSEN` | Düşüşte, stok azaltılmalı |
 
-### Feedback Sistemi
-- `feedback_top_n(dict)` — ürün bazlı satış girişi
-- `feedback_by_label(label, total)` — etiket bazlı toplu giriş
-- `feedback_batch(dict)` — birden fazla etiket aynı anda
-- Sahte trend tespiti: `sold < 5 adet VEYA tahminin < %10`
-
-### Öğrenilen Sinyaller
-- `favorite_growth_3d`: 3 günlük erken büyüme (viral uyarısı)
-- `favorite_growth_14d`: 2 haftalık standart büyüme
-- `price_change_pct`: fiyat değişimi (enflasyon etkisi)
-- `is_fav_spike`: %200+ ani artış (viral tespit)
-- `rank_velocity_7d`: rank değişim hızı
-
 ---
 
-## 📦 Gereksinimler
+## ⚙️ Scoring Mantığı (v2)
+
+Growth-rate öncelikli — mutlak popülerlik değil, **değişim hızı** esas alınır:
 
 ```
-catboost>=1.2
-pandas>=2.0
-numpy>=1.24
-scikit-learn>=1.3
-pykalman>=0.9
+trend_score = fav_growth  × 0.45   # erken büyüme sinyali (küçük ama hızlı ürün)
+            + velocity    × 0.25   # Kalman anlık değişim
+            + CatBoost    × 0.20   # tarihsel talep (azaltıldı: Pareto'yu bastırır)
+            + cart_growth × 0.10   # sepet büyümesi
 ```
 
 ---
@@ -158,8 +166,10 @@ pykalman>=0.9
 ## 🗺️ Yol Haritası
 
 - [x] CatBoost + Kalman ensemble motoru
-- [x] Gerçek zamanlı feedback loop
-- [x] Growth-rate öncelikli scoring
+- [x] Gerçek zamanlı feedback loop (`feedback_top_n`, `feedback_batch`)
+- [x] Growth-rate öncelikli scoring (relative > absolute popularity)
+- [x] 44 kolonlu gerçekçi simülasyon (JSONB + beden stok + özel günler)
+- [x] 7 kategori, 5 senaryo test suite
 - [ ] Instagram/TikTok sosyal medya sinyali
 - [ ] OpenWeatherMap hava durumu entegrasyonu
 - [ ] Trendyol Seller API otomatik entegrasyonu
