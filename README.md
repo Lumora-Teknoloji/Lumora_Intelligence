@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/CatBoost-Ensemble-brightgreen" />
   <img src="https://img.shields.io/badge/Kalman-Online%20Learning-orange" />
   <img src="https://img.shields.io/badge/Trendyol-Native-red" />
-  <img src="https://img.shields.io/badge/Simulation-44%20kolonlu-purple" />
+  <img src="https://img.shields.io/badge/Benchmark-K1--K4%20Validated-purple" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey" />
 </p>
 
@@ -13,12 +13,12 @@
 
 ## 🎯 Ne Yapar?
 
-Lumora Intelligence, Trendyol platformundaki ürünlerin trend durumunu tahmin eden, gerçek satış geri bildirimiyle öğrenen bir yapay zeka motorudur.
+Lumora Intelligence, Trendyol platformundaki ürünlerin trend durumunu tahmin eden, gerçek satış geri bildirimiyle öğrenen yapay zeka motorudur.
 
 ```
-Bu hafta hangi 5 ürünü üretmeliyim?  →  TREND listesi
-Bu ürün 2 sattı, bu 45 sattı        →  feedback_top_n()
-Bir hafta sonra                      →  Sahte trendler listeden düştü
+Bu hafta hangi ürünleri üretmeliyim?  →  TREND listesi
+Bu ürün 2 sattı, bu 45 sattı          →  feedback_top_n()
+Bir hafta sonra                        →  Sahte trendler listeden düştü
 ```
 
 ---
@@ -45,11 +45,14 @@ git clone https://github.com/Lumora-Teknoloji/Lumora_Intelligence.git
 cd Lumora_Intelligence
 pip install -r requirements.txt
 
-# 5 senaryo testi çalıştır
-python run_scenarios.py
+# CSV dataset üret (5 kademe × 4 periyot = 20 dataset)
+python data/generate_dataset.py
 
-# Tek kategori trend analizi
-python show_trend_abiye.py
+# Tüm 20 dataseti test et
+python batch_test.py
+
+# Belirli kademeyi test et
+python batch_test.py --kademeler 1 2 3
 ```
 
 ---
@@ -68,34 +71,49 @@ predictions = engine.predict()
 top5 = predictions.head(5)
 print(top5[["product_id", "trend_label", "trend_score", "confidence"]])
 
-# 3. Gerçek satış ile feedback ver (sahte trendleri öğret)
+# 3. Gerçek satış ile feedback ver
 engine.feedback_top_n({
     pid_A: 45,   # iyi sattı → sistem güvenir
     pid_B: 2,    # az sattı → SAHTE TREND → ceza ×0.35
-    pid_C: 30,
-})
-
-# 4. Toplu feedback (etiket bazlı)
-engine.feedback_batch({
-    "TREND":      450,   # Bu hafta TREND ürünler toplam 450 sattı
-    "POTANSIYEL": 80,
 })
 ```
 
 ---
 
-## 📊 Test Sonuçları (v2)
+## 📊 Benchmark Test Sonuçları (K1-K4)
 
-| Senaryo | Yükseliş Tespiti | Skor Gap |
-|---------|-----------------|----------|
-| Karma Kategoriler (Baseline) | ✅ %60.0 | +0.4 |
-| Sezonsal Pik (Kış Başlangıcı) | ⚠️ %52.3 | +4.8 |
-| Soğuk Başlangıç (Yeni Kategori) | ✅ %71.0 | — |
-| Fiyat/Enflasyon Baskısı | ⚠️ %56.2 | +1.5 |
-| Rakip Çatışması + Viral Ürün | ✅ %65.4 | — |
+> Tam detay: `results/benchmark_test_raporu.docx`
 
-> ✅ Baseline %60 eşiğini ilk kez v2'de geçti — growth-rate priority scoring ve stok sinyalleri ile.
-> ⚠️ Sonuçlar simüle veri üzerindendir. Gerçek Trendyol verisi ile %70+ doğruluk beklenmektedir.
+Algoritma, **5 gürültü seviyesi × 4 zaman periyodu = 20 farklı dataset** üzerinde test edilmiştir.
+Her test: 120 kategori × 3 trend profil × 1 ürün = **360 ürün**.
+
+### Nedensel Veri Zinciri
+
+Dataset'lerdeki metrikler gerçekçi nedensel zincire göre üretilmektedir:
+
+```
+rank ↑ → görünürlük ↑ → view_count ↑ → favorite_count ↑
+→ cart_count ↑ → satın alma → (7 gün gecikme) → rating_count artışı
+→ sosyal kanıt → fav_count'a geri besleme
+```
+
+### Ortalama Performans
+
+| Kademe | Gürültü | TREND Precision | Rising Recall | Not |
+|--------|---------|----------------|--------------|-----|
+| **K1 Kristal** | ±%8 | **%99.8** | **%99.8** | Teorik üst sınır |
+| **K2 Net** | ±%18 | **%99.2** | **%96.7** | Güvenilir |
+| **K3 Orta ★** | ±%28 | **%97.8** | **%88.6** | **Gerçek dünya** |
+| **K4 Gürültülü** | ±%42 | **%87.0** | **%58.8** | Kırılma noktası |
+
+> ★ K3 (±%28 gürültü) Trendyol üretim verilerine en yakın senaryodur.
+
+### Temel Bulgular
+
+- **TREND Precision** K3'te bile %97.8 — yanlış alarm oranı çok düşük ✅
+- **Rising Recall** K3'te %88.6 — her 9 yükselen üründen 1'i kaçırılıyor ⚠️
+- **Falling Recall** tüm kademelerde %40-58 — yapısal iyileştirme gerekli ❌
+- **Algoritma kırılma noktası:** K4 (±%42) — TREND precision %87'ye iner
 
 ---
 
@@ -104,38 +122,28 @@ engine.feedback_batch({
 ```
 Lumora_Intelligence/
 ├── engine/
-│   ├── predictor.py        # Ana motor (train + predict + feedback)
-│   └── features.py         # Feature mühendisliği (40+ özellik)
+│   ├── predictor.py            # Ana motor (train + predict + feedback)
+│   └── features.py             # Feature mühendisliği (40+ özellik, vectorized)
 ├── algorithms/
-│   ├── catboost_model.py   # CatBoost ensemble
-│   ├── kalman_filter.py    # Online öğrenme
-│   └── zscore.py           # Anomali tespiti
+│   ├── catboost_model.py       # CatBoost ensemble
+│   ├── kalman.py               # Online öğrenme
+│   ├── zscore.py               # Anomali tespiti
+│   ├── clustering.py           # Ürün kümeleme
+│   └── changepoint.py          # Trend kırılma algısı
 ├── data/
-│   ├── sample_data.py      # Gerçekçi simülasyon verisi (v3, 44 kolon)
-│   ├── scenarios.py        # 5 test senaryosu
-│   └── yearly_simulation.py
-├── run_scenarios.py        # 5 senaryo karşılaştırma testi
-├── run_yearly_persistent.py# 1 yıllık kalıcı öğrenme testi
-├── show_trend_abiye.py     # Kategori bazlı trend analizi demo
-├── demo_gercek_kullanim.py # Top-5 + feedback demo
+│   ├── generate_dataset.py     # 20 benchmark dataset üretimi
+│   └── datasets/               # k1/-k5/ × {2m,4m,6m,12m}/
+├── results/
+│   ├── benchmark_test_raporu.docx   # K1-K4 detay raporu
+│   └── batch_test_results.csv
+├── batch_test.py               # 20 dataset toplu test
+├── validate_datasets.py        # Veri bütünlüğü doğrulama
+├── check_correlations.py       # Nedensel zincir korelasyon analizi
+├── run_csv_test.py             # Tek CSV test runner
+├── config.py
+├── main.py
 └── requirements.txt
 ```
-
----
-
-## 📦 Simülasyon Verisi (v3 — 44 Kolon)
-
-`data/sample_data.py` gerçek Trendyol veritabanı yapısını yüksek doğrulukla simüle eder:
-
-| Özellik | Detay |
-|---------|-------|
-| **Kategoriler** | crop, tayt, kadın abiye, mont, kazak, elbise, spor giyim, grup |
-| **JSONB Attributes** | Her kategori için 10-14 spesifik key (bel yüksekliği, etek boyu, teknoloji...) |
-| **Beden/Stok** | `available_sizes`, `total_stock`, `stock_depth` beden bazlı stok takibi |
-| **Özel Gün Takvimi** | Sevgililer, Anneler Günü, Black Friday (11.11), Yılbaşı boost |
-| **Sezon Faktörü** | Off-season ürün %2-10'a düşer (mont yazın, crop kışın) |
-| **Pareto Dağılımı** | Gerçek uzun kuyruk favori dağılımı (%20 ürün %80 favori) |
-| **Gerçek Doluluk** | DB'den alınan oranlar: cart %3-27, view %5-58, fav %55-93 |
 
 ---
 
@@ -150,14 +158,14 @@ Lumora_Intelligence/
 
 ---
 
-## ⚙️ Scoring Mantığı (v2)
+## ⚙️ Scoring Mantığı
 
 Growth-rate öncelikli — mutlak popülerlik değil, **değişim hızı** esas alınır:
 
 ```
-trend_score = fav_growth  × 0.45   # erken büyüme sinyali (küçük ama hızlı ürün)
+trend_score = fav_growth  × 0.45   # erken büyüme sinyali
             + velocity    × 0.25   # Kalman anlık değişim
-            + CatBoost    × 0.20   # tarihsel talep (azaltıldı: Pareto'yu bastırır)
+            + CatBoost    × 0.20   # tarihsel talep
             + cart_growth × 0.10   # sepet büyümesi
 ```
 
@@ -166,15 +174,15 @@ trend_score = fav_growth  × 0.45   # erken büyüme sinyali (küçük ama hızl
 ## 🗺️ Yol Haritası
 
 - [x] CatBoost + Kalman ensemble motoru
-- [x] Gerçek zamanlı feedback loop (`feedback_top_n`, `feedback_batch`)
-- [x] Growth-rate öncelikli scoring (relative > absolute popularity)
-- [x] 44 kolonlu gerçekçi simülasyon (JSONB + beden stok + özel günler)
-- [x] 7 kategori, 5 senaryo test suite
-- [ ] Instagram/TikTok sosyal medya sinyali
-- [ ] OpenWeatherMap hava durumu entegrasyonu
+- [x] Gerçek zamanlı feedback loop
+- [x] Growth-rate öncelikli scoring
+- [x] 20 benchmark dataset (5 kademe × 4 periyot)
+- [x] Nedensel veri zinciri (rank→view→fav→cart→rating)
+- [x] K1-K4 benchmark test ve docx raporu
+- [ ] Falling recall iyileştirmesi (düşen trend erken uyarı)
+- [ ] K5 (Kaotik) kademesi testi
 - [ ] Trendyol Seller API otomatik entegrasyonu
-- [ ] Prophet sezonsal analiz (180+ gün veri ile)
-- [ ] Hepsiburada cross-platform konfirmasyon
+- [ ] Prophet sezonsal analiz (180+ gün veri)
 
 ---
 

@@ -56,6 +56,8 @@ class DemandPredictor:
         "stock_flip_count", "is_out_of_stock",
         "price_vs_category_avg", "engagement_vs_category", "cart_vs_category",
         "days_since_changepoint", "cluster_id", "visual_trend_score",
+        # v2.1: CSV üretecinden gelen zengin sinyal kolonları
+        "rank_reach_mult", "season_factor", "price_elast_boost",
     ]
 
     TARGET = "target_demand"
@@ -124,6 +126,20 @@ class DemandPredictor:
         rate  = recent["rating_count"].fillna(0).mean()
         cart  = recent["cart_count"].fillna(0).mean()
 
+        # ── rank_reach_mult: en güçlü sinyal ──────────────────────────
+        # Rising (son 30 gün): rank_reach_mult ~ 0.70-0.80  (iyi sıra)
+        # Falling (son 30 gün): rank_reach_mult ~ 0.02-0.05 (kötü sıra)
+        if "rank_reach_mult" in recent.columns:
+            reach = float(recent["rank_reach_mult"].mean())
+        else:
+            reach = 0.0
+
+        # ── season_factor: mevsimsel doğrulanma ──────────────────────
+        if "season_factor" in recent.columns:
+            season = float(recent["season_factor"].mean())
+        else:
+            season = 1.0
+
         # Favori BÜYÜME ORANI (mutlak değil)
         if "favorite_growth_14d" in recent.columns:
             fav_growth = float(recent["favorite_growth_14d"].fillna(1.0).mean())
@@ -136,7 +152,7 @@ class DemandPredictor:
                 fav_growth = 1.0
         fav_growth = max(0.05, min(10.0, fav_growth))
 
-        # Rank improvement
+        # Rank improvement (30 günlük pencereyle çok daha net)
         if "absolute_rank" in recent.columns and len(recent) >= 2:
             ranks = recent["absolute_rank"].dropna().values
             if len(ranks) >= 2:
@@ -162,15 +178,18 @@ class DemandPredictor:
         else:
             price_penalty = 1.0
 
-        # ── Hesaplama ──────────────────────────────────────────────
-        # NOT: fav_growth > 1 → log > 0, fav_growth < 1 → log < 0
-        # Bu negatif değer DUSEN sinyali verir
+        # ── Hesaplama ────────────────────────────────────────────────────
+        # rank_reach_mult:  reaching(0.7) vs falling(0.03) → en güçlü ayırıcı
+        # rank_imp:         kısa dönem rank değişimi (30günlük pencere)
+        # fav_growth:       momentum veriyle zayıf ama destekleyici
+        # season*reach:     mevsimsel onay çarpımı — eşitsiz gücü dengeler
         score = (
-            np.clip(rank_imp, -1, 1)    * 0.40 +
-            np.log(fav_growth)          * 0.35 +   # değişim oranı (negatif olabilir)
-            np.log1p(rate)              * 0.15 +
-            np.log1p(cart)              * 0.10
-        ) * price_penalty
+            reach                           * 0.45 +  # rank erişim (çok güçlü)
+            np.clip(rank_imp, -1, 1)         * 0.25 +  # rank hareketi
+            np.log(fav_growth)              * 0.15 +  # favori büyüme oranı
+            np.log1p(rate)                  * 0.08 +  # rating birikim
+            np.log1p(cart)                  * 0.07    # sepet (nadir sinyal)
+        ) * price_penalty * max(0.5, season)
 
         return max(0.0, round(float(score), 4))
 
@@ -197,7 +216,7 @@ class DemandPredictor:
                 continue
 
             last_row = product_data.iloc[-1]
-            recent = product_data.tail(7)
+            recent   = product_data.tail(30)   # 30 gün: rank hareketi net görünür
 
             # ── YENİ: Bileşik hedef değişken ──────────────────────
             target = self._compute_composite_target(recent)

@@ -142,29 +142,21 @@ class FeatureEngineer:
     # ─── MOMENTUM ───────────────────────────────────────────────
 
     def _add_momentum(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Son 7 gün / önceki 7 gün oranı."""
+        """Son 7 gün / önceki 7 gün oranı — VEKTÖRİZE."""
         for col in ["cart_count", "engagement_score", "favorite_count"]:
             if col not in df.columns:
                 continue
-
             momentum_col = f"momentum_{col}_7d"
-            df[momentum_col] = 1.0
-
-            for pid in df["product_id"].unique():
-                mask = df["product_id"] == pid
-                series = df.loc[mask, col].values
-
-                if len(series) < 14:
-                    continue
-
-                recent = np.mean(series[-7:])
-                previous = np.mean(series[-14:-7])
-
-                ratio = round(recent / (previous + 1e-6), 3)
-                last_7_idx = df[mask].tail(7).index
-                df.loc[last_7_idx, momentum_col] = ratio
-
+            # Vectorized: rolling(7) / shift(7).rolling(7)
+            recent   = df.groupby("product_id")[col].transform(
+                lambda x: x.rolling(7, min_periods=1).mean()
+            )
+            previous = df.groupby("product_id")[col].transform(
+                lambda x: x.shift(7).rolling(7, min_periods=1).mean()
+            )
+            df[momentum_col] = (recent / (previous + 1e-6)).clip(0.05, 20.0).fillna(1.0).round(3)
         return df
+
 
     # ─── VELOCITY ───────────────────────────────────────────────
 

@@ -274,17 +274,14 @@ class PredictionEngine:
             score_v = norm(vel.clip(lower=cr["velocity"][0], upper=cr["velocity"][1]))
             score_d = norm(dem.clip(lower=0))
 
-            # [FIX] CatBoost composite score'u direkt ekle — bu zaten yükseliş/düşüş
-            # öğreti. Normalizasyon bunu gizliyordu, direkt normalized olarak dahil et.
+            # CatBoost composite score
             if "predicted_demand" in cat_result.columns:
-                # CatBoost'un ham tahmini → normalize et
                 raw_cb = cat_result["predicted_demand"].fillna(0)
                 score_cb = norm(raw_cb.clip(lower=0))
             else:
                 score_cb = pd.Series(0.5, index=cat_result.index)
 
-            # favorite_growth_14d varsa onu da ekle (değişim bazlı sinyal)
-            # favorite_growth: 14d standart + 3d erken sinyal — kombinasyonu kullan
+            # favorite_growth: 14d standart + 3d erken sinyal kombinasyonu
             if "favorite_growth_14d" in cat_result.columns:
                 fg14 = cat_result["favorite_growth_14d"].fillna(1.0)
                 score_fav14 = norm(fg14.clip(0.05, 10.0))
@@ -297,23 +294,38 @@ class PredictionEngine:
             else:
                 score_fav3 = score_fav14
 
-            # Kombine: erken sinyal %60, standart %40 (erken uyarıya ağırlık ver)
             score_fav = score_fav3 * 0.60 + score_fav14 * 0.40
 
-            # Ağırlıklar — relative growth öncelikli:
-            # fav_growth  %45 → değişim oranı (küçük ama hızlı ürünü yakalar)
-            # velocity    %25 → Kalman erken sinyal
-            # CatBoost    %20 → mutlak talep (azaltıldı, Pareto'yu bastırır)
-            # cart_growth %10 → bonus sinyal
+            # ── rank_reach_mult: CSV'den gelen en güçlü sinyal ──────────────
+            # Rising son günde rank_reach ~ 0.70-0.80 (iyi sıra)
+            # Falling son günde rank_reach ~ 0.02-0.05 (kötü sıra)
+            data_cat = data[data["category"] == cat]
+            if "rank_reach_mult" in data_cat.columns:
+                reach_map = (
+                    data_cat.sort_values("date")
+                    .groupby("product_id")["rank_reach_mult"]
+                    .last()
+                    .to_dict()
+                )
+                reach_vals = cat_result["product_id"].map(reach_map).fillna(0.1)
+                score_reach = norm(reach_vals)
+            else:
+                score_reach = pd.Series(0.5, index=cat_result.index)
+
+            # Ağırlıklar:
+            # rank_reach   %30  → en güçlü ayırıcı (rising vs falling)
+            # CatBoost     %30  → composite_target şimdi rank_reach içeriyor
+            # velocity     %20  → Kalman erken sinyal
+            # fav_growth   %15  → destekleyici
+            # cart_growth   %5  → bonus
             cat_result["trend_score"] = (
-                score_fav * 0.45 +
-                score_v   * 0.25 +
-                score_cb  * 0.20 +
-                score_g   * 0.10
+                score_reach * 0.30 +
+                score_cb    * 0.30 +
+                score_v     * 0.20 +
+                score_fav   * 0.15 +
+                score_g     * 0.05
             ) * 100
             cat_result["trend_score"] = cat_result["trend_score"].round(1)
-
-
 
             # Confidence
             cb_rank = dem.rank(ascending=False, method="min")
