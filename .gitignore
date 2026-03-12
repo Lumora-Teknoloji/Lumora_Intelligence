@@ -1,80 +1,46 @@
-# ── Python ────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
+*.pyo
+*.pyd
 .Python
-env/
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
 venv/
 .venv/
-build/
-dist/
-*.egg-info/
+env/
+.env.local
 
-# ── ML / Veri ─────────────────────────────────────
-*.pkl
-*.joblib
-*.h5
-*.pt
-*.pth
-*.ckpt
-/data/raw/
-/data/external/
+# !! ASLA commit etme !!
+.env
 
-# Geçici engine state (feedback loop)
-lumora_engine_state.pkl
-*_engine_state.pkl
-
-# ── IDE ───────────────────────────────────────────
+# IDE
 .vscode/
 .idea/
-*.sublime-project
-*.sublime-workspace
-*.code-workspace
+*.swp
+*.swo
 
-# ── OS ────────────────────────────────────────────
-.DS_Store
-Thumbs.db
-desktop.ini
-ehthumbs.db
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
 
-# ── Jupyter ───────────────────────────────────────
-.ipynb_checkpoints/
-*.ipynb
-
-# ── Ortam / Config ────────────────────────────────
-.env
-.env.local
-.env.*.local
-*.env
-config/secrets.yaml
-config/secrets.json
-
-# ── Log / Test çıktıları ──────────────────────────
+# Logs
 *.log
 logs/
-tmp/
-.tmp/
 
-# ── Veritabanı bağlantı dosyaları ─────────────────
-config/db_config.py
-engine/db_config.py
-**/db_config.py
-connection_string.txt
+# CatBoost model artifacts (büyük dosyalar — ayrı storage'a al)
+*.cbm
+catboost_info/
+models/
 
-# ── Büyük veri dosyaları ──────────────────────────
-*.csv
-*.parquet
-*.feather
-*.xlsx
-!data/sample_exports/*.csv   # örnek dosyalar hariç
-
-# ── Gemini / AI araç klasörleri ───────────────────
-.gemini/
-.antigravity/
-
-# ── Rapor/Belge çıktıları (opsiyonel commit) ──────
-# LUMORA_*.docx     # raporları commit etmek istersen bu satırı sil
-
-# ── Test artefaktlar ──────────────────────────────
-generate_report.py
+# Temp scripts
+algo_test.py
+experiment.py
+check_db.py
+run_schema_sync.py

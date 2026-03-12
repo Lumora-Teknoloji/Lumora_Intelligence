@@ -1,0 +1,51 @@
+# /etc/systemd/system/lumora-intelligence.service
+# Lumora Intelligence Mikro Servis — systemd Unit
+#
+# Kurulum:
+#   sudo cp deploy/lumora-intelligence.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable lumora-intelligence
+#   sudo systemctl start lumora-intelligence
+#
+# Loglar:
+#   sudo journalctl -u lumora-intelligence -f
+
+[Unit]
+Description=Lumora Intelligence Trend Prediction Microservice
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/LancChain_Intelligence
+
+# .env dosyasından env var yükle
+EnvironmentFile=/home/ubuntu/LancChain_Intelligence/.env
+
+# Production: --reload olmadan, multi-worker (1 worker yeterli — singleton engine)
+ExecStart=/home/ubuntu/venv/bin/uvicorn app:app \
+    --host 0.0.0.0 \
+    --port 8001 \
+    --workers 1 \
+    --log-level info \
+    --access-log
+
+# Crash'te otomatik yeniden başlat (max 5 kez 60 saniyede)
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Güvenlik kısıtlamaları
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Log yönetimi
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lumora-intelligence
+
+[Install]
+WantedBy=multi-user.target
