@@ -55,11 +55,11 @@ class TrendKalmanFilter:
         S = H @ state["P"] @ H.T + R
         K = state["P"] @ H.T @ np.linalg.inv(S)
 
-        state["x"] = state["x"] + K.flatten() * float(y)
+        state["x"] = state["x"] + K.flatten() * y.item()
         state["P"] = (np.eye(2) - K @ H) @ state["P"]
 
         # Hata geçmişi (adaptive R için)
-        state["prediction_errors"].append(float(y))
+        state["prediction_errors"].append(y.item())
         if len(state["prediction_errors"]) > 20:
             state["prediction_errors"] = state["prediction_errors"][-20:]
 

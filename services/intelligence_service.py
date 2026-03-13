@@ -35,6 +35,13 @@ class IntelligenceService:
         self._trained_at: Optional[datetime] = None
         self._train_data_rows: int = 0
 
+    @staticmethod
+    def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+        """DB reader 'recorded_at' döndürür, engine 'date' bekler → rename."""
+        if "recorded_at" in df.columns and "date" not in df.columns:
+            df = df.rename(columns={"recorded_at": "date"})
+        return df
+
     # ──────────────────────────────────────────────────────────────────────────
     # Lifecycle
     # ──────────────────────────────────────────────────────────────────────────
@@ -52,6 +59,7 @@ class IntelligenceService:
                 self._engine = PredictionEngine(use_prophet=False, use_clip=False)
                 return
 
+            df = self._normalize_df(df)
             self._engine = PredictionEngine(use_prophet=False, use_clip=False)
             self._engine.train(df, verbose=False)
             self._trained_at = datetime.utcnow()
@@ -132,6 +140,7 @@ class IntelligenceService:
         try:
             # Ürüne ait son 90 günlük veri
             df = get_daily_metrics(days=90, product_ids=[product_id])
+            df = self._normalize_df(df)
 
             if df.empty:
                 return {"error": f"product_id={product_id} için veri bulunamadı"}
@@ -183,6 +192,7 @@ class IntelligenceService:
         try:
             # Ürünün kategorisini bul
             df = get_daily_metrics(days=30, product_ids=[product_id])
+            df = self._normalize_df(df)
             if df.empty:
                 return {"status": "error", "message": "Ürün verisi bulunamadı"}
 
@@ -362,6 +372,7 @@ class IntelligenceService:
                 return
 
             df = get_daily_metrics(days=data_days)
+            df = self._normalize_df(df)
             if df.empty:
                 return
 
