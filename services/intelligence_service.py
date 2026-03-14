@@ -87,6 +87,7 @@ class IntelligenceService:
         """
         Kategori için en iyi N tahmin döndürür.
         Sonuçları DB'ye de kaydeder (intelligence_results).
+        Zenginleştirilmiş ürün detayları ile birlikte döndürür.
         """
         engine = self._ensure_engine()
 
@@ -107,17 +108,128 @@ class IntelligenceService:
             else:
                 predictions_df = predictions_df.head(top_n)
 
-            # Sonuçları sözlüğe çevir
+            # Ürün ID'lerini topla
+            product_ids = predictions_df["product_id"].unique().tolist()
+
+            # Products tablosundan detayları çek
+            product_details = {}
+            latest_metrics = {}
+            if product_ids:
+                try:
+                    from sqlalchemy import text as sql_text
+                    from db.connection import engine as db_engine
+
+                    with db_engine.connect() as conn:
+                        # Ürün bilgileri
+                        prod_sql = sql_text("""
+                            SELECT id, product_code, name, brand, seller, category,
+                                   category_tag, url, image_url,
+                                   last_price, last_discount_rate, last_engagement_score,
+                                   avg_sales_velocity, dominant_color, fabric_type, fit_type,
+                                   review_summary, sizes, attributes
+                            FROM products
+                            WHERE id = ANY(:pids)
+                        """)
+                        prod_rows = conn.execute(prod_sql, {"pids": product_ids}).fetchall()
+                        for row in prod_rows:
+                            product_details[row[0]] = {
+                                "product_code": row[1],
+                                "name": row[2],
+                                "brand": row[3],
+                                "seller": row[4],
+                                "category": row[5],
+                                "category_tag": row[6],
+                                "url": row[7],
+                                "image_url": row[8],
+                                "last_price": float(row[9]) if row[9] else None,
+                                "last_discount_rate": float(row[10]) if row[10] else None,
+                                "engagement_score": float(row[11]) if row[11] else None,
+                                "avg_sales_velocity": float(row[12]) if row[12] else None,
+                                "dominant_color": row[13],
+                                "fabric_type": row[14],
+                                "fit_type": row[15],
+                                "review_summary": row[16],
+                                "sizes": row[17],
+                                "attributes": row[18],
+                            }
+
+                        # Son günün metrikleri
+                        metric_sql = sql_text("""
+                            SELECT DISTINCT ON (product_id)
+                                product_id, price, discounted_price, discount_rate,
+                                cart_count, favorite_count, view_count,
+                                rating_count, avg_rating, search_rank,
+                                engagement_score, popularity_score, sales_velocity
+                            FROM daily_metrics
+                            WHERE product_id = ANY(:pids)
+                            ORDER BY product_id, recorded_at DESC
+                        """)
+                        metric_rows = conn.execute(metric_sql, {"pids": product_ids}).fetchall()
+                        for row in metric_rows:
+                            latest_metrics[row[0]] = {
+                                "price": float(row[1]) if row[1] else None,
+                                "discounted_price": float(row[2]) if row[2] else None,
+                                "discount_rate": float(row[3]) if row[3] else None,
+                                "cart_count": int(row[4]) if row[4] else 0,
+                                "favorite_count": int(row[5]) if row[5] else 0,
+                                "view_count": int(row[6]) if row[6] else 0,
+                                "rating_count": int(row[7]) if row[7] else 0,
+                                "avg_rating": float(row[8]) if row[8] else None,
+                                "search_rank": int(row[9]) if row[9] else None,
+                                "engagement_score": float(row[10]) if row[10] else None,
+                                "popularity_score": float(row[11]) if row[11] else None,
+                                "sales_velocity": float(row[12]) if row[12] else None,
+                            }
+                except Exception as e:
+                    logger.warning(f"Ürün detayları çekilemedi: {e}")
+
+            # Sonuçları sözlüğe çevir — ZENGİNLEŞTİRİLMİŞ
             results = []
             for _, row in predictions_df.iterrows():
-                results.append({
-                    "product_id":   int(row.get("product_id", 0)),
-                    "category":     str(row.get("category", "")),
-                    "trend_label":  str(row.get("trend_label", "")),
-                    "trend_score":  float(row.get("trend_score", 0)),
-                    "confidence":   float(row.get("confidence", 0)),
-                    "ensemble_demand": float(row.get("ensemble_demand", 0)),
-                })
+                pid = int(row.get("product_id", 0))
+                detail = product_details.get(pid, {})
+                metrics = latest_metrics.get(pid, {})
+
+                result = {
+                    # Tahmin verileri
+                    "product_id":       pid,
+                    "trend_label":      str(row.get("trend_label", "")),
+                    "trend_score":      float(row.get("trend_score", 0)),
+                    "confidence":       float(row.get("confidence", 0)),
+                    "ensemble_demand":  float(row.get("ensemble_demand", 0)),
+
+                    # Ürün kimlik bilgileri
+                    "product_code":     detail.get("product_code"),
+                    "name":             detail.get("name"),
+                    "brand":            detail.get("brand"),
+                    "seller":           detail.get("seller"),
+                    "category":         detail.get("category") or str(row.get("category", "")),
+                    "category_tag":     detail.get("category_tag"),
+                    "url":              detail.get("url"),
+                    "image_url":        detail.get("image_url"),
+
+                    # Fiyat bilgileri
+                    "price":            metrics.get("price") or detail.get("last_price"),
+                    "discounted_price": metrics.get("discounted_price"),
+                    "discount_rate":    metrics.get("discount_rate") or detail.get("last_discount_rate"),
+
+                    # Stil özellikleri
+                    "dominant_color":   detail.get("dominant_color"),
+                    "fabric_type":      detail.get("fabric_type"),
+                    "fit_type":         detail.get("fit_type"),
+                    "sizes":            detail.get("sizes"),
+
+                    # Performans metrikleri
+                    "favorite_count":   metrics.get("favorite_count", 0),
+                    "cart_count":       metrics.get("cart_count", 0),
+                    "view_count":       metrics.get("view_count", 0),
+                    "rating_count":     metrics.get("rating_count", 0),
+                    "avg_rating":       metrics.get("avg_rating"),
+                    "search_rank":      metrics.get("search_rank"),
+                    "engagement_score": metrics.get("engagement_score") or detail.get("engagement_score"),
+                    "sales_velocity":   metrics.get("sales_velocity") or detail.get("avg_sales_velocity"),
+                }
+                results.append(result)
 
             # DB'ye yaz (background — hatalar sessizce loglanır)
             try:
