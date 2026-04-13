@@ -1,0 +1,5 @@
+﻿kademe,kademe_name,period,n_products,trend_precision,trend_count,dusen_precision,rising_recall,falling_recall,potansiyel_rising_pct,elapsed_sec
+3,Orta,2m,360,93.9,115,74.7,90.0,46.7,17.6,47.4
+3,Orta,4m,360,99.1,112,65.9,92.5,46.7,20.5,66.4
+3,Orta,6m,360,99.1,108,62.5,89.2,45.8,32.5,47.4
+3,Orta,12m,360,99.0,100,66.7,82.5,58.3,39.6,41.2
