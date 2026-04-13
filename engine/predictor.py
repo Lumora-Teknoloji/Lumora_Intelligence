@@ -70,6 +70,13 @@ class PredictionEngine:
 
         self.is_trained = False
 
+        # Varsayilan tuning parametreleri
+        self.DEFAULT_TUNING = {
+            "score_weights": {"growth": 0.40, "velocity": 0.35, "demand": 0.25},
+            "clip_ranges": {"growth": (-100, 500), "velocity": (-5, 10)},
+            "label_thresholds": {"trend": 70, "potansiyel": 40, "stabil": 20},
+        }
+
     def train(self, df: pd.DataFrame, verbose=True):
         """v2: Tam pipeline eğitimi."""
         if verbose:
@@ -191,12 +198,6 @@ class PredictionEngine:
             print("EGITIM TAMAMLANDI")
             print("=" * 60)
 
-    # Varsayilan tuning parametreleri
-    DEFAULT_TUNING = {
-        "score_weights": {"growth": 0.40, "velocity": 0.35, "demand": 0.25},
-        "clip_ranges": {"growth": (-100, 500), "velocity": (-5, 10)},
-        "label_thresholds": {"trend": 70, "potansiyel": 40, "stabil": 20},
-    }
 
     def predict(self, df: pd.DataFrame = None, tuning_params: dict = None,
                 category_tuning: dict = None) -> pd.DataFrame:
@@ -227,22 +228,29 @@ class PredictionEngine:
                     tp[key] = default
             return tp
 
-        data = df if df is not None else self._last_training_data
+        # use_cache = True if user doesn't pass a new df or passes the training df
+        use_cache = (df is None or df is getattr(self, "_last_training_data", None))
+        data = getattr(self, "_last_training_data", pd.DataFrame()) if df is None else df
 
         # CatBoost tahminleri — per-category
-        all_cb_predictions = []
-        for cat in data["category"].unique():
-            cat_data = data[data["category"] == cat]
-            cat_pred = self.registry.predict_category(cat, cat_data)
-            if cat_pred.empty:
-                # Fallback: global model
-                cat_pred = self.catboost.predict(cat_data)
-            if not cat_pred.empty:
-                all_cb_predictions.append(cat_pred)
+        if use_cache and getattr(self, "_cached_cb_preds", None) is not None:
+            cb_predictions = self._cached_cb_preds
+        else:
+            all_cb_predictions = []
+            for cat, cat_data in data.groupby("category"):
+                cat_pred = self.registry.predict_category(cat, cat_data)
+                if cat_pred.empty:
+                    # Fallback: global model
+                    cat_pred = self.catboost.predict(cat_data)
+                if not cat_pred.empty:
+                    all_cb_predictions.append(cat_pred)
 
-        if not all_cb_predictions:
-            return pd.DataFrame()
-        cb_predictions = pd.concat(all_cb_predictions, ignore_index=True)
+            if not all_cb_predictions:
+                return pd.DataFrame()
+            cb_predictions = pd.concat(all_cb_predictions, ignore_index=True)
+            
+            if use_cache:
+                self._cached_cb_preds = cb_predictions
 
         # Kalman tahminleri
         kalman_cat_results = []
@@ -266,18 +274,24 @@ class PredictionEngine:
         kalman_prod_df = pd.DataFrame(kalman_prod_results)
 
         # Cart buyume oranini hesapla (ilk vs son dönem)
-        growth_results = []
-        for pid in data["product_id"].unique():
-            pdata = data[data["product_id"] == pid].sort_values("date")
-            n = len(pdata)
-            if n < 6:
-                growth_results.append({"product_id": pid, "cart_growth_pct": 0.0})
-                continue
-            first = pdata.head(max(3, n // 3))["cart_count"].mean()
-            last = pdata.tail(max(3, n // 3))["cart_count"].mean()
-            growth = (last - first) / (first + 1e-6) * 100
-            growth_results.append({"product_id": pid, "cart_growth_pct": round(growth, 1)})
-        growth_df = pd.DataFrame(growth_results)
+        if use_cache and getattr(self, "_cached_growth_df", None) is not None:
+            growth_df = self._cached_growth_df
+        else:
+            growth_results = []
+            for pid, pdata in data.groupby("product_id"):
+                pdata = pdata.sort_values("date")
+                n = len(pdata)
+                if n < 6:
+                    growth_results.append({"product_id": pid, "cart_growth_pct": 0.0})
+                    continue
+                first = pdata.head(max(3, n // 3))["cart_count"].mean()
+                last = pdata.tail(max(3, n // 3))["cart_count"].mean()
+                growth = (last - first) / (first + 1e-6) * 100
+                growth_results.append({"product_id": pid, "cart_growth_pct": round(growth, 1)})
+            growth_df = pd.DataFrame(growth_results)
+            
+            if use_cache:
+                self._cached_growth_df = growth_df
 
         # Birlestir
         product_cats = data.groupby("product_id")["category"].first().reset_index()
@@ -295,9 +309,8 @@ class PredictionEngine:
 
         # Her kategori kendi parametreleri ile skorlanır
         scored_parts = []
-        for cat in result["category"].unique():
-            mask = result["category"] == cat
-            cat_result = result[mask].copy()
+        for cat, cat_result in result.groupby("category"):
+            cat_result = cat_result.copy()
             tp = resolve_params(cat)
             sw = tp["score_weights"]
             cr = tp["clip_ranges"]
@@ -783,30 +796,31 @@ class PredictionEngine:
         }
 
     def _update_weights(self):
-        """[YENi] Feedback'e gore ensemble agirliklarini guncelle."""
+        """[YENi] Feedback'e gore ensemble agirliklarini sürekli (continuous) sekilde güncelle."""
         recent = self.feedback_history[-20:]
         if not recent:
             return
 
-        # Güvenli erişim — batch/top_n feedback kayıtlarında "error" key'i olmayabilir
-        errors = [f.get("error", 0) for f in recent if "error" in f]
-        if not errors:
-            return  # Sadece batch feedback var, per-product error yok
-        avg_error = np.mean(errors)
+        # Güvenli erişim
+        accuracies = [f.get("accuracy", 1.0) for f in recent if "accuracy" in f]
+        if not accuracies:
+            return  # Sadece batch feedback var, accuracy yok
+            
+        avg_acc = np.mean(accuracies)
+        err_rate = 1.0 - avg_acc  # 0.0 mükemmel, 1.0 tamamen yanlis
 
-        # Hata buyukse Kalman'a daha cok agirlik ver (daha reaktif)
-        if avg_error > 50:
-            self.weights["catboost"] = 0.5
-            self.weights["kalman_product"] = 0.3
-            self.weights["kalman_category"] = 0.2
-        elif avg_error > 20:
-            self.weights["catboost"] = 0.55
-            self.weights["kalman_product"] = 0.27
-            self.weights["kalman_category"] = 0.18
-        else:
-            self.weights["catboost"] = 0.6
-            self.weights["kalman_product"] = 0.24
-            self.weights["kalman_category"] = 0.16
+        # Gerçek Continuous Adaptive Mapping (Lookup yerine dinamik):
+        # Ortalama hata oranina göre, Kalman (anlık momentum) ve Catboost 
+        # (gecmis egitim) arasindaki dengeyi scale et. 
+        # Hata yokken Catboost'a guven (%75), hata yuksekse Kalman'a gecis yap (%65)
+        
+        w_cb = 0.75 - (0.40 * err_rate)          # 0.75 -> 0.35'e ilerler
+        w_kp = 0.15 + (0.30 * err_rate)          # 0.15 -> 0.45'e cikar
+        w_kc = 1.0 - (w_cb + w_kp)               # kalani (0.10 -> 0.20 gidis)
+
+        self.weights["catboost"] = round(float(w_cb), 3)
+        self.weights["kalman_product"] = round(float(w_kp), 3)
+        self.weights["kalman_category"] = round(float(w_kc), 3)
 
     def predict_for_inventory(self, material: str, color: str = None,
                                category: str = None) -> dict:

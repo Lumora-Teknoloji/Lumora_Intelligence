@@ -212,28 +212,60 @@ class IntelligenceService:
             # Ürün ID'lerini topla
             product_ids = predictions_df["product_id"].unique().tolist()
 
-            # Products tablosundan detayları çek
             product_details = {}
             latest_metrics = {}
+            new_entrants_map = {}
+
             if product_ids:
                 try:
                     from sqlalchemy import text as sql_text
                     from db.connection import engine as db_engine
 
                     with db_engine.connect() as conn:
-                        # Ürün bilgileri
-                        prod_sql = sql_text("""
-                            SELECT id, product_code, name, brand, seller, category,
-                                   category_tag, url, image_url,
-                                   last_price, last_discount_rate, last_engagement_score,
-                                   avg_sales_velocity, dominant_color, fabric_type, fit_type,
-                                   review_summary, sizes, attributes
-                            FROM products
-                            WHERE id = ANY(:pids)
+                        combined_sql = sql_text("""
+                            WITH latest_metrics AS (
+                                SELECT DISTINCT ON (product_id)
+                                    product_id, price, discounted_price, discount_rate,
+                                    cart_count, favorite_count, view_count,
+                                    rating_count, avg_rating, search_rank,
+                                    engagement_score, popularity_score, sales_velocity,
+                                    rank_change_1d, rank_change_3d, rank_velocity,
+                                    momentum_score
+                                FROM daily_metrics
+                                WHERE product_id = ANY(:pids)
+                                ORDER BY product_id, recorded_at DESC
+                            ),
+                            latest_ne AS (
+                                SELECT DISTINCT ON (product_id) product_id, is_new_entrant
+                                FROM daily_metrics
+                                WHERE product_id = ANY(:pids) AND is_new_entrant IS NOT NULL
+                                ORDER BY product_id, recorded_at DESC
+                            )
+                            SELECT 
+                                p.id, p.product_code, p.name, p.brand, p.seller, p.category,
+                                p.category_tag, p.url, p.image_url,
+                                p.last_price, p.last_discount_rate, p.last_engagement_score,
+                                p.avg_sales_velocity, p.dominant_color, p.fabric_type, p.fit_type,
+                                p.review_summary, p.sizes, p.attributes,
+                                dm.price, dm.discounted_price, dm.discount_rate,
+                                dm.cart_count, dm.favorite_count, dm.view_count,
+                                dm.rating_count, dm.avg_rating, dm.search_rank,
+                                dm.engagement_score AS m_engagement_score, 
+                                dm.popularity_score, 
+                                dm.sales_velocity AS m_sales_velocity,
+                                dm.rank_change_1d, dm.rank_change_3d, dm.rank_velocity,
+                                dm.momentum_score, ne.is_new_entrant
+                            FROM products p
+                            LEFT JOIN latest_metrics dm ON p.id = dm.product_id
+                            LEFT JOIN latest_ne ne ON p.id = ne.product_id
+                            WHERE p.id = ANY(:pids)
                         """)
-                        prod_rows = conn.execute(prod_sql, {"pids": product_ids}).fetchall()
-                        for row in prod_rows:
-                            product_details[row[0]] = {
+                        rows = conn.execute(combined_sql, {"pids": product_ids}).fetchall()
+
+                        for row in rows:
+                            pid = row[0]
+                            # Products 
+                            product_details[pid] = {
                                 "product_code": row[1],
                                 "name": row[2],
                                 "brand": row[3],
@@ -242,10 +274,10 @@ class IntelligenceService:
                                 "category_tag": row[6],
                                 "url": row[7],
                                 "image_url": row[8],
-                                "last_price": float(row[9]) if row[9] else None,
-                                "last_discount_rate": float(row[10]) if row[10] else None,
-                                "engagement_score": float(row[11]) if row[11] else None,
-                                "avg_sales_velocity": float(row[12]) if row[12] else None,
+                                "last_price": float(row[9]) if row[9] is not None else None,
+                                "last_discount_rate": float(row[10]) if row[10] is not None else None,
+                                "engagement_score": float(row[11]) if row[11] is not None else None,
+                                "avg_sales_velocity": float(row[12]) if row[12] is not None else None,
                                 "dominant_color": row[13],
                                 "fabric_type": row[14],
                                 "fit_type": row[15],
@@ -253,61 +285,30 @@ class IntelligenceService:
                                 "sizes": row[17],
                                 "attributes": row[18],
                             }
-
-                        # Son günün metrikleri + rank momentum
-                        metric_sql = sql_text("""
-                            SELECT DISTINCT ON (product_id)
-                                product_id, price, discounted_price, discount_rate,
-                                cart_count, favorite_count, view_count,
-                                rating_count, avg_rating, search_rank,
-                                engagement_score, popularity_score, sales_velocity,
-                                rank_change_1d, rank_change_3d, rank_velocity,
-                                momentum_score
-                            FROM daily_metrics
-                            WHERE product_id = ANY(:pids)
-                            ORDER BY product_id, recorded_at DESC
-                        """)
-                        metric_rows = conn.execute(metric_sql, {"pids": product_ids}).fetchall()
-                        for row in metric_rows:
-                            latest_metrics[row[0]] = {
-                                "price": float(row[1]) if row[1] else None,
-                                "discounted_price": float(row[2]) if row[2] else None,
-                                "discount_rate": float(row[3]) if row[3] else None,
-                                "cart_count": int(row[4]) if row[4] else 0,
-                                "favorite_count": int(row[5]) if row[5] else 0,
-                                "view_count": int(row[6]) if row[6] else 0,
-                                "rating_count": int(row[7]) if row[7] else 0,
-                                "avg_rating": float(row[8]) if row[8] else None,
-                                "search_rank": int(row[9]) if row[9] else None,
-                                "engagement_score": float(row[10]) if row[10] else None,
-                                "popularity_score": float(row[11]) if row[11] else None,
-                                "sales_velocity": float(row[12]) if row[12] else None,
-                                "rank_change_1d": int(row[13]) if row[13] else None,
-                                "rank_change_3d": int(row[14]) if row[14] else None,
-                                "rank_velocity": float(row[15]) if row[15] else None,
-                                "momentum_score": float(row[16]) if row[16] else None,
+                            # Metrics
+                            latest_metrics[pid] = {
+                                "price": float(row[19]) if row[19] is not None else None,
+                                "discounted_price": float(row[20]) if row[20] is not None else None,
+                                "discount_rate": float(row[21]) if row[21] is not None else None,
+                                "cart_count": int(row[22]) if row[22] is not None else 0,
+                                "favorite_count": int(row[23]) if row[23] is not None else 0,
+                                "view_count": int(row[24]) if row[24] is not None else 0,
+                                "rating_count": int(row[25]) if row[25] is not None else 0,
+                                "avg_rating": float(row[26]) if row[26] is not None else None,
+                                "search_rank": int(row[27]) if row[27] is not None else None,
+                                "engagement_score": float(row[28]) if row[28] is not None else None,
+                                "popularity_score": float(row[29]) if row[29] is not None else None,
+                                "sales_velocity": float(row[30]) if row[30] is not None else None,
+                                "rank_change_1d": int(row[31]) if row[31] is not None else None,
+                                "rank_change_3d": int(row[32]) if row[32] is not None else None,
+                                "rank_velocity": float(row[33]) if row[33] is not None else None,
+                                "momentum_score": float(row[34]) if row[34] is not None else None,
                             }
+                            # New Entrant
+                            if row[35] is not None:
+                                new_entrants_map[pid] = bool(row[35])
                 except Exception as e:
-                    logger.warning(f"Ürün detayları çekilemedi: {e}")
-
-            # is_new_entrant bilgisini daily_metrics'ten çek
-            new_entrants_map = {}
-            if product_ids:
-                try:
-                    from sqlalchemy import text as sql_text2
-                    from db.connection import engine as db_engine2
-                    with db_engine2.connect() as conn:
-                        ne_sql = sql_text2("""
-                            SELECT DISTINCT ON (product_id) product_id, is_new_entrant
-                            FROM daily_metrics
-                            WHERE product_id = ANY(:pids)
-                              AND is_new_entrant IS NOT NULL
-                            ORDER BY product_id, recorded_at DESC
-                        """)
-                        ne_rows = conn.execute(ne_sql, {"pids": product_ids}).fetchall()
-                        new_entrants_map = {row[0]: bool(row[1]) for row in ne_rows}
-                except Exception:
-                    pass  # Opsiyonel — hata sessizce loglanır
+                    logger.warning(f"Ürün verileri veritabanından çekilemedi: {e}")
 
             # Sonuçları sözlüğe çevir — ZENGİNLEŞTİRİLMİŞ
             results = []
@@ -404,8 +405,23 @@ class IntelligenceService:
             if df.empty:
                 return {"error": f"product_id={product_id} için veri bulunamadı"}
 
-            # Engine'i bu ürün üzerinde çalıştır
-            preds = engine.predict()
+            # Kolon normalizasyonu (Feature engine için)
+            if "product_category" in df.columns and "category" not in df.columns:
+                df = df.rename(columns={"product_category": "category"})
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+            # Veriyi temizle ve sadece bu ürün için feature'ları çıkar
+            df_clean = engine.zscore.filter_errors(df)
+            df_clean = engine.zscore.detect_anomalies(df_clean)
+            
+            if df_clean.empty:
+                return {"error": f"product_id={product_id} analiz edilebilecek yeterli temiz veriye sahip değil"}
+                
+            df_feat = engine.feature_eng.build_features(df_clean)
+
+            # Sadece bu ürün üzerinde çalıştır (Global 10k product loop'undan kurtarır)
+            preds = engine.predict(df=df_feat)
 
             if not preds.empty and "product_id" in preds.columns:
                 prd_row = preds[preds["product_id"] == product_id]
@@ -457,7 +473,12 @@ class IntelligenceService:
 
             category = df["category"].iloc[0] if "category" in df.columns else "unknown"
 
-            engine.feedback(category, sold_quantity, predicted_quantity)
+            engine.feedback(
+                category=category, 
+                actual_sales=sold_quantity, 
+                predicted_demand=predicted_quantity, 
+                product_id=product_id
+            )
 
             # Büyük hata → alert üret
             error_pct = abs(sold_quantity - predicted_quantity) / max(predicted_quantity, 1) * 100
@@ -724,31 +745,22 @@ class IntelligenceService:
         trend_count: int = 0,
     ):
         """Backend /api/intelligence/callback endpoint'ine bildirim gönderir."""
-        import asyncio, urllib.request, json as _json
+        import httpx
         from datetime import datetime, timezone
 
-        def _post():
-            try:
-                from config import BACKEND_CALLBACK_URL
-                body = _json.dumps({
-                    "event":       event,
-                    "category":    category,
-                    "trend_count": trend_count,
-                    "timestamp":   datetime.now(timezone.utc).isoformat(),
-                }).encode()
-                req = urllib.request.Request(
-                    BACKEND_CALLBACK_URL,
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                )
-                urllib.request.urlopen(req, timeout=5).read()
-                logger.debug("Backend callback bildirimi gönderildi")
-            except Exception as e:
-                logger.debug(f"Backend callback gönderilemedi (normal): {e}")
-
-        # async context içinde threading kullan — blocking IO olmasın
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _post)
+        try:
+            from config import BACKEND_CALLBACK_URL
+            payload = {
+                "event":       event,
+                "category":    category,
+                "trend_count": trend_count,
+                "timestamp":   datetime.now(timezone.utc).isoformat(),
+            }
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(BACKEND_CALLBACK_URL, json=payload)
+            logger.debug("Backend callback bildirimi gönderildi")
+        except Exception as e:
+            logger.debug(f"Backend callback gönderilemedi (normal): {e}")
 
 
     async def weekly_retrain(self):
