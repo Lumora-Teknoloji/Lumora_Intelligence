@@ -4,6 +4,10 @@ Lumora Intelligence — Mikro Servis Konfigürasyonu
 """
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# ─── .env dosyasını yükle ──────────────────────────────────────────────────
+load_dotenv(Path(__file__).parent / ".env")
 
 # ─── Ortam değişkenleri (.env dosyasından okunur) ──────────────────────────
 def _env(key: str, default: str = "") -> str:

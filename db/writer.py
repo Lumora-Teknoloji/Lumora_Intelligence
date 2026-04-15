@@ -323,6 +323,9 @@ def _ensure_tables():
         "CREATE INDEX IF NOT EXISTS idx_style_trends_date       ON style_trends(signal_date DESC, search_term)",
         "CREATE INDEX IF NOT EXISTS idx_model_versions_cat      ON model_versions(category, trained_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_categories_lifecycle    ON categories_registry(lifecycle, search_term)",
+        # ── categories_registry şema migrasyonları (idempotent) ──────────
+        "ALTER TABLE categories_registry ADD COLUMN IF NOT EXISTS group_name VARCHAR(200)",
+        "ALTER TABLE categories_registry ADD COLUMN IF NOT EXISTS overrides  JSONB DEFAULT '{}'",
     ]
 
     try:
