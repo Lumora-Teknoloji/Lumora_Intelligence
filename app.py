@@ -74,7 +74,7 @@ async def verify_internal_key(request: Request, call_next):
         return await call_next(request)
 
     # Key boşsa (dev mode) → pas geç
-    if not config.INTERNAL_API_KEY or config.INTERNAL_API_KEY == "lumora-internal-dev-key":
+    if config.APP_ENV != "production" and (not config.INTERNAL_API_KEY or config.INTERNAL_API_KEY == "lumora-internal-dev-key"):
         return await call_next(request)
 
     key = request.headers.get("X-Internal-Key", "")
