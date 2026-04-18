@@ -16,8 +16,6 @@ from config import ENSEMBLE_CATBOOST_WEIGHT, ENSEMBLE_KALMAN_WEIGHT
 from algorithms.zscore import ZScoreDetector
 from algorithms.kalman import TrendKalmanFilter
 from algorithms.catboost_model import DemandPredictor
-from algorithms.changepoint import ChangePointDetector
-from algorithms.clustering import ProductClusterer
 from engine.features import FeatureEngineer
 from engine.model_registry import CategoryModelRegistry
 
@@ -28,11 +26,15 @@ class PredictionEngine:
     Adaptive ağırlıklar feedback loop ile güncellenir.
     """
 
-    def __init__(self, use_prophet=False, use_clip=False):
+    DEFAULT_TUNING = {
+        "score_weights": {"growth": 0.40, "velocity": 0.35, "demand": 0.25},
+        "clip_ranges": {"growth": (-100, 500), "velocity": (-5, 10)},
+        "label_thresholds": {"trend": 70, "potansiyel": 40, "stabil": 20},
+    }
+
+    def __init__(self):
         self.zscore = ZScoreDetector()
         self.feature_eng = FeatureEngineer()
-        self.clusterer = ProductClusterer()
-        self.cpd = ChangePointDetector()
         self.registry = CategoryModelRegistry()   # Per-category CatBoost
         self.catboost = DemandPredictor()           # Fallback global model
         self.kalman = TrendKalmanFilter()
@@ -55,27 +57,14 @@ class PredictionEngine:
         self._prediction_history: dict = {}
         self._predict_call_count: int = 0
 
-        self.prophet = None
-        self.clip = None
-        self.use_prophet = use_prophet
-        self.use_clip = use_clip
-
-        if use_prophet:
-            from algorithms.prophet_model import SeasonalAnalyzer
-            self.prophet = SeasonalAnalyzer()
-
-        if use_clip:
-            from algorithms.clip_model import VisualMatcher
-            self.clip = VisualMatcher()
-
         self.is_trained = False
 
-        # Varsayilan tuning parametreleri
-        self.DEFAULT_TUNING = {
-            "score_weights": {"growth": 0.40, "velocity": 0.35, "demand": 0.25},
-            "clip_ranges": {"growth": (-100, 500), "velocity": (-5, 10)},
-            "label_thresholds": {"trend": 70, "potansiyel": 40, "stabil": 20},
-        }
+        # State persistence dosya yolu
+        import os
+        self._state_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "engine_state.json"
+        )
 
     def train(self, df: pd.DataFrame, verbose=True):
         """v2: Tam pipeline eğitimi."""
@@ -131,14 +120,6 @@ class PredictionEngine:
         # - K-Prototypes: kategori zaten CatBoost'ta kategorik feature
         # - İkisi de somut doğruluk kazanımı sağlamadı, complexity ekliyordu
 
-        # Katman 3d: Prophet (opsiyonel)
-        if self.use_prophet and self.prophet:
-            if verbose:
-                print("[Katman 3d] Prophet mevsimsel ayristirma")
-            df_feat = self.prophet.add_features_to_df(df_feat)
-            if verbose:
-                print("  Mevsimsel feature'lar eklendi")
-                print()
 
         # Katman 4a: CatBoost — Per-category eğitim
         if verbose:
@@ -199,120 +180,49 @@ class PredictionEngine:
             print("=" * 60)
 
 
-    def predict(self, df: pd.DataFrame = None, tuning_params: dict = None,
-                category_tuning: dict = None) -> pd.DataFrame:
-        """v3: CatBoost + Kalman + Growth Rate = Trend Score.
+    def _resolve_params(self, category, tuning_params, category_tuning):
+        tp = {}
+        for key, default in self.DEFAULT_TUNING.items():
+            if category_tuning and category in category_tuning and key in category_tuning[category]:
+                tp[key] = category_tuning[category][key]
+            elif tuning_params and key in tuning_params:
+                tp[key] = tuning_params[key]
+            else:
+                tp[key] = default
+        return tp
 
-        tuning_params: global override (tüm kategoriler için)
-        category_tuning: kategori bazlı override dict
-            {"crop": {"score_weights": {...}, ...}, "tayt": {...}, ...}
-
-        Öncelik: category_tuning > tuning_params > DEFAULT_TUNING
-        """
-        if not self.is_trained:
-            print("Motor henuz egitilmedi!")
-            return pd.DataFrame()
-
-        # Tuning parametre çözücü: category_tuning > tuning_params > DEFAULT_TUNING
-        def resolve_params(category=None):
-            tp = {}
-            for key, default in self.DEFAULT_TUNING.items():
-                # 1. Category-specific override
-                if category_tuning and category in category_tuning and key in category_tuning[category]:
-                    tp[key] = category_tuning[category][key]
-                # 2. Global override
-                elif tuning_params and key in tuning_params:
-                    tp[key] = tuning_params[key]
-                # 3. Default
-                else:
-                    tp[key] = default
-            return tp
-
-        # use_cache = True if user doesn't pass a new df or passes the training df
-        use_cache = (df is None or df is getattr(self, "_last_training_data", None))
-        data = getattr(self, "_last_training_data", pd.DataFrame()) if df is None else df
-
-        # CatBoost tahminleri — per-category
-        if use_cache and getattr(self, "_cached_cb_preds", None) is not None:
-            cb_predictions = self._cached_cb_preds
-        else:
-            all_cb_predictions = []
-            for cat, cat_data in data.groupby("category"):
-                cat_pred = self.registry.predict_category(cat, cat_data)
-                if cat_pred.empty:
-                    # Fallback: global model
-                    cat_pred = self.catboost.predict(cat_data)
-                if not cat_pred.empty:
-                    all_cb_predictions.append(cat_pred)
-
-            if not all_cb_predictions:
-                return pd.DataFrame()
-            cb_predictions = pd.concat(all_cb_predictions, ignore_index=True)
-            
-            if use_cache:
-                self._cached_cb_preds = cb_predictions
-
-        # Kalman tahminleri
-        kalman_cat_results = []
-        for category in data["category"].unique():
-            state = self.kalman.get_state(category)
-            kalman_cat_results.append({
-                "category": category,
-                "kalman_cat_demand": state["demand"],
-                "kalman_cat_velocity": state["velocity"],
-            })
-        kalman_cat_df = pd.DataFrame(kalman_cat_results)
-
-        kalman_prod_results = []
-        for pid in data["product_id"].unique():
-            state = self.kalman.get_product_state(pid)
-            kalman_prod_results.append({
-                "product_id": pid,
-                "kalman_prod_demand": state["demand"],
-                "kalman_prod_velocity": state["velocity"],
-            })
-        kalman_prod_df = pd.DataFrame(kalman_prod_results)
-
-        # Cart buyume oranini hesapla (ilk vs son dönem)
+    def _compute_growth_rates(self, data, use_cache):
         if use_cache and getattr(self, "_cached_growth_df", None) is not None:
-            growth_df = self._cached_growth_df
-        else:
-            growth_results = []
-            for pid, pdata in data.groupby("product_id"):
-                pdata = pdata.sort_values("date")
-                n = len(pdata)
-                if n < 6:
-                    growth_results.append({"product_id": pid, "cart_growth_pct": 0.0})
-                    continue
-                first = pdata.head(max(3, n // 3))["cart_count"].mean()
-                last = pdata.tail(max(3, n // 3))["cart_count"].mean()
-                growth = (last - first) / (first + 1e-6) * 100
-                growth_results.append({"product_id": pid, "cart_growth_pct": round(growth, 1)})
-            growth_df = pd.DataFrame(growth_results)
+            return self._cached_growth_df
             
-            if use_cache:
-                self._cached_growth_df = growth_df
+        growth_results = []
+        for pid, pdata in data.groupby("product_id"):
+            pdata = pdata.sort_values("date")
+            n = len(pdata)
+            if n < 6:
+                growth_results.append({"product_id": pid, "cart_growth_pct": 0.0})
+                continue
+            first = pdata.head(max(3, n // 3))["cart_count"].mean()
+            last = pdata.tail(max(3, n // 3))["cart_count"].mean()
+            growth = (last - first) / (first + 1e-6) * 100
+            growth_results.append({"product_id": pid, "cart_growth_pct": round(growth, 1)})
+            
+        growth_df = pd.DataFrame(growth_results)
+        if use_cache:
+            self._cached_growth_df = growth_df
+        return growth_df
 
-        # Birlestir
-        product_cats = data.groupby("product_id")["category"].first().reset_index()
-        result = cb_predictions.merge(product_cats, on="product_id", how="left")
-        result = result.merge(kalman_cat_df, on="category", how="left")
-        result = result.merge(kalman_prod_df, on="product_id", how="left")
-        result = result.merge(growth_df, on="product_id", how="left")
-
-        # ── TREND SCORE — KATEGORİ BAZLI ─────────────────────────
+    def _apply_scoring(self, result, data, tuning_params, category_tuning):
         def norm(s):
             r = s.max() - s.min()
             if r < 1e-6:
                 return pd.Series(0.5, index=s.index)
             return (s - s.min()) / r
 
-        # Her kategori kendi parametreleri ile skorlanır
         scored_parts = []
         for cat, cat_result in result.groupby("category"):
             cat_result = cat_result.copy()
-            tp = resolve_params(cat)
-            sw = tp["score_weights"]
+            tp = self._resolve_params(cat, tuning_params, category_tuning)
             cr = tp["clip_ranges"]
 
             vel = cat_result["kalman_prod_velocity"].fillna(0)
@@ -321,62 +231,37 @@ class PredictionEngine:
 
             score_g = norm(gr.clip(lower=cr["growth"][0], upper=cr["growth"][1]))
             score_v = norm(vel.clip(lower=cr["velocity"][0], upper=cr["velocity"][1]))
-            score_d = norm(dem.clip(lower=0))
 
-            # CatBoost composite score
             if "predicted_demand" in cat_result.columns:
-                raw_cb = cat_result["predicted_demand"].fillna(0)
-                score_cb = norm(raw_cb.clip(lower=0))
+                score_cb = norm(cat_result["predicted_demand"].fillna(0).clip(lower=0))
             else:
                 score_cb = pd.Series(0.5, index=cat_result.index)
 
-            # favorite_growth: 14d standart + 3d erken sinyal kombinasyonu
             if "favorite_growth_14d" in cat_result.columns:
-                fg14 = cat_result["favorite_growth_14d"].fillna(1.0)
-                score_fav14 = norm(fg14.clip(0.05, 10.0))
+                score_fav14 = norm(cat_result["favorite_growth_14d"].fillna(1.0).clip(0.05, 10.0))
             else:
                 score_fav14 = pd.Series(0.5, index=cat_result.index)
 
             if "favorite_growth_3d" in cat_result.columns:
-                fg3 = cat_result["favorite_growth_3d"].fillna(1.0)
-                score_fav3 = norm(fg3.clip(0.05, 15.0))
+                score_fav3 = norm(cat_result["favorite_growth_3d"].fillna(1.0).clip(0.05, 15.0))
             else:
                 score_fav3 = score_fav14
 
             score_fav = score_fav3 * 0.60 + score_fav14 * 0.40
 
-            # ── rank_reach_mult: CSV'den gelen en güçlü sinyal ──────────────
-            # Rising son günde rank_reach ~ 0.70-0.80 (iyi sıra)
-            # Falling son günde rank_reach ~ 0.02-0.05 (kötü sıra)
             data_cat = data[data["category"] == cat]
             if "rank_reach_mult" in data_cat.columns:
-                reach_map = (
-                    data_cat.sort_values("date")
-                    .groupby("product_id")["rank_reach_mult"]
-                    .last()
-                    .to_dict()
-                )
-                reach_vals = cat_result["product_id"].map(reach_map).fillna(0.1)
-                score_reach = norm(reach_vals)
+                reach_map = data_cat.sort_values("date").groupby("product_id")["rank_reach_mult"].last().to_dict()
+                score_reach = norm(cat_result["product_id"].map(reach_map).fillna(0.1))
             else:
                 score_reach = pd.Series(0.5, index=cat_result.index)
 
-            # Ağırlıklar:
-            # rank_reach   %30  → en güçlü ayırıcı (rising vs falling)
-            # CatBoost     %30  → composite_target şimdi rank_reach içeriyor
-            # velocity     %20  → Kalman erken sinyal
-            # fav_growth   %15  → destekleyici
-            # cart_growth   %5  → bonus
             cat_result["trend_score"] = (
-                score_reach * 0.30 +
-                score_cb    * 0.30 +
-                score_v     * 0.20 +
-                score_fav   * 0.15 +
-                score_g     * 0.05
+                score_reach * 0.30 + score_cb * 0.30 + score_v * 0.20 +
+                score_fav * 0.15 + score_g * 0.05
             ) * 100
             cat_result["trend_score"] = cat_result["trend_score"].round(1)
 
-            # Confidence
             cb_rank = dem.rank(ascending=False, method="min")
             kl_rank = vel.rank(ascending=False, method="min")
             gr_rank = gr.rank(ascending=False, method="min")
@@ -388,17 +273,11 @@ class PredictionEngine:
             else:
                 cat_result["confidence"] = 50
 
-            # ── [ADIM 3] Hybrid Quantile Eşikler ─────────────────
-            # Quantile + minimum floor — baseline gerileme sorununu çözer
             scores = cat_result["trend_score"]
             if nc >= 6:
-                p85 = max(scores.quantile(0.85), 62.0)  # floor: en az 62
-                p55 = max(scores.quantile(0.55), 42.0)  # floor: en az 42
-                p25 = max(scores.quantile(0.25), 22.0)  # floor: en az 22
+                p85, p55, p25 = max(scores.quantile(0.85), 62.0), max(scores.quantile(0.55), 42.0), max(scores.quantile(0.25), 22.0)
             elif nc >= 4:
-                p85 = max(scores.quantile(0.80), 60.0)
-                p55 = max(scores.quantile(0.50), 40.0)
-                p25 = max(scores.quantile(0.25), 20.0)
+                p85, p55, p25 = max(scores.quantile(0.80), 60.0), max(scores.quantile(0.50), 40.0), max(scores.quantile(0.25), 20.0)
             else:
                 p85, p55, p25 = 70.0, 45.0, 25.0
 
@@ -407,86 +286,102 @@ class PredictionEngine:
                 np.where(scores >= p55, "POTANSIYEL",
                 np.where(scores >= p25, "STABIL", "DUSEN")))
 
-            # ── [ADIM 4] Aktif DUSEN Override ─────────────────────
-            # Rank hızla kötüleşiyor VE favori azalıyorsa → DUSEN
-            if "abs_rank_change_7d" in cat_result.columns and \
-               "favorite_growth_14d" in cat_result.columns:
-                rank_worsening = cat_result["abs_rank_change_7d"] > 300  # 300+ pozisyon kaybı
-                fav_declining  = cat_result["favorite_growth_14d"] < 0.80  # %20+ favori kaybı
-                dusen_override = rank_worsening & fav_declining
-                cat_result.loc[dusen_override, "trend_label"] = "DUSEN"
-
-            # ── [ADIM 5] Viral Spike Override ─────────────────────
-            # 7 günde %200+ favori artışı VE rank iyileşiyorsa → TREND
-            if "is_fav_spike" in cat_result.columns and \
-               "rank_improving_strong" in cat_result.columns:
-                spike_mask = (
-                    (cat_result["is_fav_spike"] == 1) &
-                    (cat_result["rank_improving_strong"] == 1)
-                )
-                cat_result.loc[spike_mask, "trend_label"] = "TREND"
-
             scored_parts.append(cat_result)
 
+        return pd.concat(scored_parts, ignore_index=True)
 
+    def _apply_overrides(self, result):
+        if "abs_rank_change_7d" in result.columns and "favorite_growth_14d" in result.columns:
+            dusen_override = (result["abs_rank_change_7d"] > 300) & (result["favorite_growth_14d"] < 0.80)
+            result.loc[dusen_override, "trend_label"] = "DUSEN"
 
-        result = pd.concat(scored_parts, ignore_index=True)
+        if "is_fav_spike" in result.columns and "rank_improving_strong" in result.columns:
+            spike_mask = (result["is_fav_spike"] == 1) & (result["rank_improving_strong"] == 1)
+            result.loc[spike_mask, "trend_label"] = "TREND"
+        return result
 
-        # Ensemble demand
+    def _apply_penalties(self, result):
+        if self._feedback_penalties:
+            result["feedback_penalty"] = result["product_id"].map(lambda pid: self._feedback_penalties.get(int(pid), 1.0))
+            result["trend_score"] = (result["trend_score"] * result["feedback_penalty"]).round(1)
+            result["ensemble_demand"] = (result["ensemble_demand"] * result["feedback_penalty"]).clip(lower=0).round(0).astype(int)
+
+            lt = self.DEFAULT_TUNING["label_thresholds"]
+            result["trend_label"] = np.where(
+                result["trend_score"] >= lt["trend"], "TREND",
+                np.where(result["trend_score"] >= lt["potansiyel"], "POTANSIYEL",
+                np.where(result["trend_score"] >= lt["stabil"], "STABIL", "DUSEN")))
+        return result
+
+    def predict(self, df: pd.DataFrame = None, tuning_params: dict = None,
+                category_tuning: dict = None) -> pd.DataFrame:
+        if not self.is_trained:
+            print("Motor henuz egitilmedi!")
+            return pd.DataFrame()
+
+        self._decay_penalties()
+
+        use_cache = (df is None or df is getattr(self, "_last_training_data", None))
+        data = getattr(self, "_last_training_data", pd.DataFrame()) if df is None else df
+
+        if use_cache and getattr(self, "_cached_cb_preds", None) is not None:
+            cb_predictions = self._cached_cb_preds
+        else:
+            all_cb_predictions = []
+            for cat, cat_data in data.groupby("category"):
+                cat_pred = self.registry.predict_category(cat, cat_data)
+                if cat_pred.empty:
+                    cat_pred = self.catboost.predict(cat_data)
+                if not cat_pred.empty:
+                    all_cb_predictions.append(cat_pred)
+
+            if not all_cb_predictions:
+                import logging as _log
+                _log.getLogger(__name__).info("CatBoost modeli yok — cold-start heuristic kullanılıyor")
+                latest = data.sort_values("date").groupby("product_id").last().reset_index()
+                heuristic_cols = ["product_id"]
+                if "category" in latest.columns: heuristic_cols.append("category")
+                heuristic = latest[heuristic_cols].copy()
+                heuristic["predicted_demand"] = (
+                    latest["cart_count"].fillna(0) * 0.3 + latest["favorite_count"].fillna(0) * 0.2 +
+                    latest.get("engagement_score", pd.Series(0)).fillna(0) * 50
+                ).clip(lower=0).round(0).astype(int)
+                cb_predictions = heuristic[["product_id", "predicted_demand"]]
+            else:
+                cb_predictions = pd.concat(all_cb_predictions, ignore_index=True)
+            if use_cache: self._cached_cb_preds = cb_predictions
+
+        kalman_cat_df = pd.DataFrame([{"category": cat, "kalman_cat_demand": self.kalman.get_state(cat)["demand"], "kalman_cat_velocity": self.kalman.get_state(cat)["velocity"]} for cat in data["category"].unique()])
+        kalman_prod_df = pd.DataFrame([{"product_id": pid, "kalman_prod_demand": self.kalman.get_product_state(pid)["demand"], "kalman_prod_velocity": self.kalman.get_product_state(pid)["velocity"]} for pid in data["product_id"].unique()])
+        
+        growth_df = self._compute_growth_rates(data, use_cache)
+
+        product_cats = data.groupby("product_id")["category"].first().reset_index()
+        result = cb_predictions.merge(product_cats, on="product_id", how="left")
+        result = result.merge(kalman_cat_df, on="category", how="left")
+        result = result.merge(kalman_prod_df, on="product_id", how="left")
+        result = result.merge(growth_df, on="product_id", how="left")
+
+        result = self._apply_scoring(result, data, tuning_params, category_tuning)
+        result = self._apply_overrides(result)
+
         w = self.weights
         cb_d = result["predicted_demand"]
         kp_d = result["kalman_prod_demand"].fillna(cb_d)
         kc_d = result["kalman_cat_demand"].fillna(cb_d)
-        result["ensemble_demand"] = np.round(
-            cb_d * w["catboost"] + kp_d * w["kalman_product"] + kc_d * w["kalman_category"]
-        ).clip(lower=0).astype(int)
+        result["ensemble_demand"] = np.round(cb_d * w["catboost"] + kp_d * w["kalman_product"] + kc_d * w["kalman_category"]).clip(lower=0).astype(int)
 
-        # ── Feedback cezalarını uygula ─────────────────────────────
-        # Normalizasyon sonrası direkt çarpar → kategoriden bağımsız
-        if self._feedback_penalties:
-            result["feedback_penalty"] = result["product_id"].map(
-                lambda pid: self._feedback_penalties.get(int(pid), 1.0)
-            )
-            result["trend_score"] = (
-                result["trend_score"] * result["feedback_penalty"]
-            ).round(1)
-            result["ensemble_demand"] = (
-                result["ensemble_demand"] * result["feedback_penalty"]
-            ).clip(lower=0).round(0).astype(int)
+        result = self._apply_penalties(result)
 
-            # Etiketi de güncelle (skor değişti)
-            lt_default = self.DEFAULT_TUNING["label_thresholds"]
-            result["trend_label"] = np.where(
-                result["trend_score"] >= lt_default["trend"],     "TREND",
-                np.where(result["trend_score"] >= lt_default["potansiyel"], "POTANSIYEL",
-                np.where(result["trend_score"] >= lt_default["stabil"],     "STABIL",
-                "DUSEN")))
+        columns = ["product_id", "category", "trend_score", "trend_label", "confidence", "cart_growth_pct", "kalman_prod_velocity", "predicted_demand", "ensemble_demand", "kalman_prod_demand", "kalman_cat_demand"]
+        final = result[[c for c in columns if c in result.columns]].sort_values("trend_score", ascending=False)
 
-        columns = ["product_id", "category",
-                   "trend_score", "trend_label", "confidence",
-                   "cart_growth_pct", "kalman_prod_velocity",
-                   "predicted_demand", "ensemble_demand",
-                   "kalman_prod_demand", "kalman_cat_demand"]
-        final = result[[c for c in columns if c in result.columns]].sort_values(
-            "trend_score", ascending=False)
-
-        # ── Tahmin snapshot'u kaydet (batch feedback için) ───────────
         self._predict_call_count += 1
         period_key = f"period_{self._predict_call_count}"
-        label_groups: dict = {}
-        for lbl in ["TREND", "POTANSIYEL", "STABIL", "DUSEN"]:
-            pids = final[final["trend_label"] == lbl]["product_id"].tolist()
-            demands = final[final["trend_label"] == lbl]["ensemble_demand"].tolist()
-            label_groups[lbl] = {
-                "product_ids": [int(p) for p in pids],
-                "predicted_demands": [int(d) for d in demands],
-                "total_predicted": int(sum(demands)),
-            }
-        self._prediction_history[period_key] = label_groups
-        # Son 12 tahmin tut, eskisini sil
+        self._prediction_history[period_key] = {lbl: {"product_ids": [int(p) for p in final[final["trend_label"] == lbl]["product_id"].tolist()], "predicted_demands": [int(d) for d in final[final["trend_label"] == lbl]["ensemble_demand"].tolist()], "total_predicted": int(sum(final[final["trend_label"] == lbl]["ensemble_demand"].tolist()))} for lbl in ["TREND", "POTANSIYEL", "STABIL", "DUSEN"]}
+        
         if len(self._prediction_history) > 12:
-            oldest = min(self._prediction_history.keys())
-            del self._prediction_history[oldest]
+            del self._prediction_history[min(self._prediction_history.keys())]
 
         return final
 
@@ -911,3 +806,114 @@ class PredictionEngine:
             # Per-category model durumu
             "registry_status": self.registry.status(),
         }
+
+    # ──────────────────────────────────────────────────────────────
+    # Bug 7: Feedback Penalties Decay
+    # ──────────────────────────────────────────────────────────────
+
+    def _decay_penalties(self):
+        """Her predict() çağrısında cezaları %5 hafiflet.
+        
+        - penalty >= 0.95 → cezayı tamamen sil (pratik olarak cezasız)
+        - Diğer → %5 decay uygula (zamanla unutma)
+        Bu sayede tek bir kötü tahmin sonsuza kadar ceza vermez.
+        """
+        if not self._feedback_penalties:
+            return
+
+        to_delete = []
+        for pid, penalty in self._feedback_penalties.items():
+            new_penalty = min(1.0, penalty * 1.05)  # %5 decay
+            if new_penalty >= 0.95:
+                to_delete.append(pid)
+            else:
+                self._feedback_penalties[pid] = round(new_penalty, 3)
+        for pid in to_delete:
+            del self._feedback_penalties[pid]
+
+    # ──────────────────────────────────────────────────────────────
+    # Bug 3: State Persistence
+    # ──────────────────────────────────────────────────────────────
+
+    def save_state(self):
+        """Motor state'ini diske kaydet (restart-proof).
+        
+        Kaydedilen veriler:
+        - Feedback cezaları (_feedback_penalties)
+        - Ensemble ağırlıkları (weights)
+        - Feedback geçmişi (son 100 kayıt)
+        - Kalman filtreleri (kategori + ürün state'leri)
+        """
+        import json, os, logging as _log
+        logger = _log.getLogger(__name__)
+
+        try:
+            state = {
+                "feedback_penalties": {str(k): v for k, v in self._feedback_penalties.items()},
+                "weights": self.weights,
+                "feedback_history": self.feedback_history[-100:],
+                "kalman_states": self.kalman.get_all_states(),
+                "kalman_product_states": self.kalman.get_all_product_states(),
+                "predict_call_count": self._predict_call_count,
+            }
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            # Atomic write: önce temp'e yaz, sonra rename
+            tmp_file = self._state_file + ".tmp"
+            with open(tmp_file, "w") as f:
+                json.dump(state, f, default=str)
+            os.replace(tmp_file, self._state_file)
+            logger.info(
+                f"💾 Engine state kaydedildi: "
+                f"{len(self._feedback_penalties)} ceza, "
+                f"{len(self.feedback_history)} feedback"
+            )
+        except Exception as e:
+            logger.warning(f"State kaydetme hatası: {e}")
+
+    def load_state(self):
+        """Disk'ten motor state'ini geri yükle."""
+        import json, os, logging as _log
+        logger = _log.getLogger(__name__)
+
+        if not os.path.exists(self._state_file):
+            logger.info("State dosyası bulunamadı — temiz başlangıç")
+            return
+
+        try:
+            with open(self._state_file) as f:
+                state = json.load(f)
+
+            # Feedback penalties
+            self._feedback_penalties = {
+                int(k): v for k, v in state.get("feedback_penalties", {}).items()
+            }
+
+            # Ensemble weights
+            saved_weights = state.get("weights", {})
+            if saved_weights:
+                self.weights = saved_weights
+
+            # Feedback history
+            self.feedback_history = state.get("feedback_history", [])
+
+            # Predict call count
+            self._predict_call_count = state.get("predict_call_count", 0)
+
+            # Kalman category states
+            for cat, s in state.get("kalman_states", {}).items():
+                self.kalman.restore_state(cat, s)
+
+            # Kalman product states
+            for pid, s in state.get("kalman_product_states", {}).items():
+                self.kalman.restore_product_state(int(pid), s)
+
+            logger.info(
+                f"📂 Engine state yüklendi: "
+                f"{len(self._feedback_penalties)} ceza, "
+                f"{len(self.feedback_history)} feedback, "
+                f"{len(state.get('kalman_states', {}))} kategori Kalman, "
+                f"{len(state.get('kalman_product_states', {}))} ürün Kalman"
+            )
+        except Exception as e:
+            logger.warning(f"State yükleme hatası (devam): {e}")
+

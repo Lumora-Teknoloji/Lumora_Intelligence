@@ -167,3 +167,35 @@ class TrendKalmanFilter:
         if key in self.product_states:
             self._predict(self.product_states[key])
             self._update(self.product_states[key], actual_value)
+
+    # ─── STATE PERSISTENCE ─────────────────────────────────────
+
+    def get_all_product_states(self) -> dict:
+        """Tüm ürün state'lerini döner (disk persist için)."""
+        return {k: self.get_product_state(int(k)) for k in self.product_states}
+
+    def restore_state(self, key: str, state_dict: dict):
+        """Disk'ten kategori state'ini geri yükle."""
+        demand = state_dict.get("demand", 0.0)
+        velocity = state_dict.get("velocity", 0.0)
+        uncertainty = state_dict.get("uncertainty", 100.0)
+        self.states[key] = {
+            "x": np.array([demand, velocity]),
+            "P": np.eye(2) * (uncertainty / 2),  # trace = uncertainty
+            "history": [],
+            "prediction_errors": [],
+        }
+
+    def restore_product_state(self, product_id: int, state_dict: dict):
+        """Disk'ten ürün state'ini geri yükle."""
+        key = str(product_id)
+        demand = state_dict.get("demand", 0.0)
+        velocity = state_dict.get("velocity", 0.0)
+        uncertainty = state_dict.get("uncertainty", 100.0)
+        self.product_states[key] = {
+            "x": np.array([demand, velocity]),
+            "P": np.eye(2) * (uncertainty / 2),
+            "history": [],
+            "prediction_errors": [],
+        }
+

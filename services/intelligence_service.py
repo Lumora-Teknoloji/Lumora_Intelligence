@@ -36,12 +36,35 @@ class IntelligenceService:
         self._trained_at: Optional[datetime] = None
         self._train_data_rows: int = 0
 
+        # Bug 1: Predict cache (TTL tabanlı)
+        self._predict_cache: dict[str, list[dict]] = {}   # {cache_key: results}
+        self._predict_cache_at: dict[str, datetime] = {}  # {cache_key: timestamp}
+        self._PREDICT_CACHE_TTL = 300  # 5 dakika
+
     @staticmethod
     def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         """DB reader 'recorded_at' döndürür, engine 'date' bekler → rename."""
         if "recorded_at" in df.columns and "date" not in df.columns:
             df = df.rename(columns={"recorded_at": "date"})
         return df
+
+    def _prepare_training_data(self, df_work: pd.DataFrame) -> pd.DataFrame:
+        col_renames = {}
+        if "product_category" in df_work.columns and "category" not in df_work.columns:
+            col_renames["product_category"] = "category"
+        elif "product_category" in df_work.columns and "category" in df_work.columns and df_work["category"].isna().all():
+            df_work.drop(columns=["category"], inplace=True)
+            col_renames["product_category"] = "category"
+        if "recorded_at" in df_work.columns and "date" not in df_work.columns:
+            col_renames["recorded_at"] = "date"
+        if col_renames:
+            df_work = df_work.rename(columns=col_renames)
+        if "date" in df_work.columns:
+            df_work["date"] = pd.to_datetime(df_work["date"], errors="coerce")
+        
+        df_clean = self._engine.zscore.filter_errors(df_work)
+        df_clean = self._engine.zscore.detect_anomalies(df_clean)
+        return self._engine.feature_eng.build_features(df_clean)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -62,11 +85,11 @@ class IntelligenceService:
             df = get_daily_metrics(days=90)
             if df.empty:
                 logger.warning("⚠ DB'de henüz veri yok — Engine mock-free modda başlıyor")
-                self._engine = PredictionEngine(use_prophet=False, use_clip=False)
+                self._engine = PredictionEngine()
                 return
 
             df = self._normalize_df(df)
-            self._engine = PredictionEngine(use_prophet=False, use_clip=False)
+            self._engine = PredictionEngine()
 
             # ── Kategori Otomatik Sınıflandırma ──────────────────────────────
             try:
@@ -86,6 +109,10 @@ class IntelligenceService:
 
             # ── Daha önce eğitilmiş per-category modelleri yükle ─────────────
             self._engine.registry.load_all()
+
+            # Bug 3: Disk’ten state geri yükle (feedback penalties, Kalman, weights)
+            self._engine.load_state()
+
             loaded = self._engine.registry.trained_categories
             
             if loaded:
@@ -96,25 +123,8 @@ class IntelligenceService:
                 logger.info("⚡ Hızlı başlatma — mevcut modeller kullanılıyor (retraining atlandı)")
                 
                 try:
-                    # Kolon adı normalizasyonu (train() içindeki ile aynı mantık)
                     df_work = df.copy()
-                    col_renames = {}
-                    if "product_category" in df_work.columns and "category" not in df_work.columns:
-                        col_renames["product_category"] = "category"
-                    elif "product_category" in df_work.columns and "category" in df_work.columns and df_work["category"].isna().all():
-                        df_work.drop(columns=["category"], inplace=True)
-                        col_renames["product_category"] = "category"
-                    if "recorded_at" in df_work.columns and "date" not in df_work.columns:
-                        col_renames["recorded_at"] = "date"
-                    if col_renames:
-                        df_work = df_work.rename(columns=col_renames)
-                    if "date" in df_work.columns:
-                        df_work["date"] = pd.to_datetime(df_work["date"], errors="coerce")
-                    
-                    # Z-Score + Feature Engineering (predict için gerekli)
-                    df_clean = self._engine.zscore.filter_errors(df_work)
-                    df_clean = self._engine.zscore.detect_anomalies(df_clean)
-                    df_feat = self._engine.feature_eng.build_features(df_clean)
+                    df_feat = self._prepare_training_data(df_work)
                     
                     # Kalman filtreler (kategori + ürün bazlı)
                     for category in df_feat["category"].unique():
@@ -172,12 +182,12 @@ class IntelligenceService:
             )
         except Exception as e:
             logger.error(f"❌ Engine eğitim hatası: {e}", exc_info=True)
-            self._engine = PredictionEngine(use_prophet=False, use_clip=False)
+            self._engine = PredictionEngine()
 
     def _ensure_engine(self) -> PredictionEngine:
         if self._engine is None:
             logger.warning("Engine henüz başlatılmadı, varsayılan oluşturuluyor")
-            self._engine = PredictionEngine(use_prophet=False, use_clip=False)
+            self._engine = PredictionEngine()
         return self._engine
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -189,8 +199,18 @@ class IntelligenceService:
         Kategori için en iyi N tahmin döndürür.
         Sonuçları DB'ye de kaydeder (intelligence_results).
         Zenginleştirilmiş ürün detayları ile birlikte döndürür.
+
+        Bug 1 Fix: TTL cache ile aynı sonuçlar tekrar hesaplanmaz.
         """
         engine = self._ensure_engine()
+
+        # ── Bug 1: Cache kontrolü (5dk TTL) ───────────────────────────
+        cache_key = f"{category or 'ALL'}:{top_n}"
+        now = datetime.utcnow()
+        cached_at = self._predict_cache_at.get(cache_key)
+        if cached_at and (now - cached_at).total_seconds() < self._PREDICT_CACHE_TTL:
+            logger.debug(f"predict() cache hit: {cache_key}")
+            return self._predict_cache[cache_key]
 
         try:
             predictions_df: pd.DataFrame = engine.predict()
@@ -212,172 +232,11 @@ class IntelligenceService:
             # Ürün ID'lerini topla
             product_ids = predictions_df["product_id"].unique().tolist()
 
-            product_details = {}
-            latest_metrics = {}
-            new_entrants_map = {}
-
-            if product_ids:
-                try:
-                    from sqlalchemy import text as sql_text
-                    from db.connection import engine as db_engine
-
-                    with db_engine.connect() as conn:
-                        combined_sql = sql_text("""
-                            WITH latest_metrics AS (
-                                SELECT DISTINCT ON (product_id)
-                                    product_id, price, discounted_price, discount_rate,
-                                    cart_count, favorite_count, view_count,
-                                    rating_count, avg_rating, search_rank,
-                                    engagement_score, popularity_score, sales_velocity,
-                                    rank_change_1d, rank_change_3d, rank_velocity,
-                                    momentum_score
-                                FROM daily_metrics
-                                WHERE product_id = ANY(:pids)
-                                ORDER BY product_id, recorded_at DESC
-                            ),
-                            latest_ne AS (
-                                SELECT DISTINCT ON (product_id) product_id, is_new_entrant
-                                FROM daily_metrics
-                                WHERE product_id = ANY(:pids) AND is_new_entrant IS NOT NULL
-                                ORDER BY product_id, recorded_at DESC
-                            )
-                            SELECT 
-                                p.id, p.product_code, p.name, p.brand, p.seller, p.category,
-                                p.category_tag, p.url, p.image_url,
-                                p.last_price, p.last_discount_rate, p.last_engagement_score,
-                                p.avg_sales_velocity, p.dominant_color, p.fabric_type, p.fit_type,
-                                p.review_summary, p.sizes, p.attributes,
-                                dm.price, dm.discounted_price, dm.discount_rate,
-                                dm.cart_count, dm.favorite_count, dm.view_count,
-                                dm.rating_count, dm.avg_rating, dm.search_rank,
-                                dm.engagement_score AS m_engagement_score, 
-                                dm.popularity_score, 
-                                dm.sales_velocity AS m_sales_velocity,
-                                dm.rank_change_1d, dm.rank_change_3d, dm.rank_velocity,
-                                dm.momentum_score, ne.is_new_entrant
-                            FROM products p
-                            LEFT JOIN latest_metrics dm ON p.id = dm.product_id
-                            LEFT JOIN latest_ne ne ON p.id = ne.product_id
-                            WHERE p.id = ANY(:pids)
-                        """)
-                        rows = conn.execute(combined_sql, {"pids": product_ids}).fetchall()
-
-                        for row in rows:
-                            pid = row[0]
-                            # Products 
-                            product_details[pid] = {
-                                "product_code": row[1],
-                                "name": row[2],
-                                "brand": row[3],
-                                "seller": row[4],
-                                "category": row[5],
-                                "category_tag": row[6],
-                                "url": row[7],
-                                "image_url": row[8],
-                                "last_price": float(row[9]) if row[9] is not None else None,
-                                "last_discount_rate": float(row[10]) if row[10] is not None else None,
-                                "engagement_score": float(row[11]) if row[11] is not None else None,
-                                "avg_sales_velocity": float(row[12]) if row[12] is not None else None,
-                                "dominant_color": row[13],
-                                "fabric_type": row[14],
-                                "fit_type": row[15],
-                                "review_summary": row[16],
-                                "sizes": row[17],
-                                "attributes": row[18],
-                            }
-                            # Metrics
-                            latest_metrics[pid] = {
-                                "price": float(row[19]) if row[19] is not None else None,
-                                "discounted_price": float(row[20]) if row[20] is not None else None,
-                                "discount_rate": float(row[21]) if row[21] is not None else None,
-                                "cart_count": int(row[22]) if row[22] is not None else 0,
-                                "favorite_count": int(row[23]) if row[23] is not None else 0,
-                                "view_count": int(row[24]) if row[24] is not None else 0,
-                                "rating_count": int(row[25]) if row[25] is not None else 0,
-                                "avg_rating": float(row[26]) if row[26] is not None else None,
-                                "search_rank": int(row[27]) if row[27] is not None else None,
-                                "engagement_score": float(row[28]) if row[28] is not None else None,
-                                "popularity_score": float(row[29]) if row[29] is not None else None,
-                                "sales_velocity": float(row[30]) if row[30] is not None else None,
-                                "rank_change_1d": int(row[31]) if row[31] is not None else None,
-                                "rank_change_3d": int(row[32]) if row[32] is not None else None,
-                                "rank_velocity": float(row[33]) if row[33] is not None else None,
-                                "momentum_score": float(row[34]) if row[34] is not None else None,
-                            }
-                            # New Entrant
-                            if row[35] is not None:
-                                new_entrants_map[pid] = bool(row[35])
-                except Exception as e:
-                    logger.warning(f"Ürün verileri veritabanından çekilemedi: {e}")
+            # Zenginleştirme (product details + metrics)
+            product_details, latest_metrics, new_entrants_map = self._fetch_product_enrichment(product_ids)
 
             # Sonuçları sözlüğe çevir — ZENGİNLEŞTİRİLMİŞ
-            results = []
-            for _, row in predictions_df.iterrows():
-                pid = int(row.get("product_id", 0))
-                detail = product_details.get(pid, {})
-                metrics = latest_metrics.get(pid, {})
-
-                # JSONB attributes'tan ek detaylar çıkar
-                attrs = detail.get("attributes") or {}
-                if isinstance(attrs, str):
-                    import json as _j
-                    try: attrs = _j.loads(attrs)
-                    except: attrs = {}
-
-                result = {
-                    # Tahmin verileri
-                    "product_id":       pid,
-                    "trend_label":      str(row.get("trend_label", "")),
-                    "trend_score":      float(row.get("trend_score", 0)),
-                    "confidence":       float(row.get("confidence", 0)),
-                    "ensemble_demand":  float(row.get("ensemble_demand", 0)),
-
-                    # Ürün kimlik bilgileri
-                    "product_code":     detail.get("product_code"),
-                    "name":             detail.get("name"),
-                    "brand":            detail.get("brand"),
-                    "seller":           detail.get("seller"),
-                    "category":         detail.get("category") or str(row.get("category", "")),
-                    "category_tag":     detail.get("category_tag"),
-                    "url":              detail.get("url"),
-                    "image_url":        detail.get("image_url"),
-
-                    # Fiyat bilgileri
-                    "price":            metrics.get("price") or detail.get("last_price"),
-                    "discounted_price": metrics.get("discounted_price"),
-                    "discount_rate":    metrics.get("discount_rate") or detail.get("last_discount_rate"),
-
-                    # Stil özellikleri
-                    "dominant_color":   detail.get("dominant_color"),
-                    "fabric_type":      detail.get("fabric_type"),
-                    "fit_type":         detail.get("fit_type"),
-                    "sizes":            detail.get("sizes"),
-
-                    # JSONB ek özellikler — zengin detay
-                    "attributes":       attrs,
-                    "review_summary":   detail.get("review_summary"),
-
-                    # Performans metrikleri
-                    "favorite_count":   metrics.get("favorite_count", 0),
-                    "cart_count":       metrics.get("cart_count", 0),
-                    "view_count":       metrics.get("view_count", 0),
-                    "rating_count":     metrics.get("rating_count", 0),
-                    "avg_rating":       metrics.get("avg_rating"),
-                    "search_rank":      metrics.get("search_rank"),
-                    "engagement_score": metrics.get("engagement_score") or detail.get("engagement_score"),
-                    "popularity_score": metrics.get("popularity_score"),
-                    "sales_velocity":   metrics.get("sales_velocity") or detail.get("avg_sales_velocity"),
-
-                    # Rank momentum verileri
-                    "rank_change_1d":   metrics.get("rank_change_1d"),
-                    "rank_change_3d":   metrics.get("rank_change_3d"),
-                    "rank_velocity":    metrics.get("rank_velocity"),
-                    "momentum_score":   metrics.get("momentum_score"),
-
-                    # Intelligence sinyalleri
-                    "is_new_entrant":   new_entrants_map.get(pid, False),
-                }
-                results.append(result)
+            results = self._enrich_predictions(predictions_df, product_details, latest_metrics, new_entrants_map)
 
             # DB'ye yaz (background — hatalar sessizce loglanır)
             try:
@@ -385,11 +244,203 @@ class IntelligenceService:
             except Exception as e:
                 logger.warning(f"Tahmin DB'ye yazılamadı: {e}")
 
+            # ── Bug 1: Cache'e yaz ─────────────────────────────────
+            self._predict_cache[cache_key] = results
+            self._predict_cache_at[cache_key] = now
+
             return results
 
         except Exception as e:
             logger.error(f"predict() hatası: {e}", exc_info=True)
             return []
+
+    def _fetch_product_enrichment(self, product_ids: list[int]) -> tuple[dict, dict, dict]:
+        """
+        Ürün detaylarını ve metriklerini tek seferde çeker.
+        predict() ve nightly_batch() tarafından ortak kullanılır.
+        
+        Returns:
+            (product_details, latest_metrics, new_entrants_map)
+        """
+        product_details = {}
+        latest_metrics = {}
+        new_entrants_map = {}
+
+        if not product_ids:
+            return product_details, latest_metrics, new_entrants_map
+
+        try:
+            from sqlalchemy import text as sql_text
+            from db.connection import engine as db_engine
+
+            with db_engine.connect() as conn:
+                combined_sql = sql_text("""
+                    WITH latest_metrics AS (
+                        SELECT DISTINCT ON (product_id)
+                            product_id, price, discounted_price, discount_rate,
+                            cart_count, favorite_count, view_count,
+                            rating_count, avg_rating, search_rank,
+                            engagement_score, popularity_score, sales_velocity,
+                            rank_change_1d, rank_change_3d, rank_velocity,
+                            momentum_score
+                        FROM daily_metrics
+                        WHERE product_id = ANY(:pids)
+                        ORDER BY product_id, recorded_at DESC
+                    ),
+                    latest_ne AS (
+                        SELECT DISTINCT ON (product_id) product_id, is_new_entrant
+                        FROM daily_metrics
+                        WHERE product_id = ANY(:pids) AND is_new_entrant IS NOT NULL
+                        ORDER BY product_id, recorded_at DESC
+                    )
+                    SELECT 
+                        p.id, p.product_code, p.name, p.brand, p.seller, p.category,
+                        p.category_tag, p.url, p.image_url,
+                        p.last_price, p.last_discount_rate, p.last_engagement_score,
+                        p.avg_sales_velocity, p.dominant_color, p.fabric_type, p.fit_type,
+                        p.review_summary, p.sizes, p.attributes,
+                        dm.price, dm.discounted_price, dm.discount_rate,
+                        dm.cart_count, dm.favorite_count, dm.view_count,
+                        dm.rating_count, dm.avg_rating, dm.search_rank,
+                        dm.engagement_score AS m_engagement_score, 
+                        dm.popularity_score, 
+                        dm.sales_velocity AS m_sales_velocity,
+                        dm.rank_change_1d, dm.rank_change_3d, dm.rank_velocity,
+                        dm.momentum_score, ne.is_new_entrant
+                    FROM products p
+                    LEFT JOIN latest_metrics dm ON p.id = dm.product_id
+                    LEFT JOIN latest_ne ne ON p.id = ne.product_id
+                    WHERE p.id = ANY(:pids)
+                """)
+                rows = conn.execute(combined_sql, {"pids": product_ids}).fetchall()
+
+                for row in rows:
+                    pid = row[0]
+                    # Products 
+                    product_details[pid] = {
+                        "product_code": row[1],
+                        "name": row[2],
+                        "brand": row[3],
+                        "seller": row[4],
+                        "category": row[5],
+                        "category_tag": row[6],
+                        "url": row[7],
+                        "image_url": row[8],
+                        "last_price": float(row[9]) if row[9] is not None else None,
+                        "last_discount_rate": float(row[10]) if row[10] is not None else None,
+                        "engagement_score": float(row[11]) if row[11] is not None else None,
+                        "avg_sales_velocity": float(row[12]) if row[12] is not None else None,
+                        "dominant_color": row[13],
+                        "fabric_type": row[14],
+                        "fit_type": row[15],
+                        "review_summary": row[16],
+                        "sizes": row[17],
+                        "attributes": row[18],
+                    }
+                    # Metrics
+                    latest_metrics[pid] = {
+                        "price": float(row[19]) if row[19] is not None else None,
+                        "discounted_price": float(row[20]) if row[20] is not None else None,
+                        "discount_rate": float(row[21]) if row[21] is not None else None,
+                        "cart_count": int(row[22]) if row[22] is not None else 0,
+                        "favorite_count": int(row[23]) if row[23] is not None else 0,
+                        "view_count": int(row[24]) if row[24] is not None else 0,
+                        "rating_count": int(row[25]) if row[25] is not None else 0,
+                        "avg_rating": float(row[26]) if row[26] is not None else None,
+                        "search_rank": int(row[27]) if row[27] is not None else None,
+                        "engagement_score": float(row[28]) if row[28] is not None else None,
+                        "popularity_score": float(row[29]) if row[29] is not None else None,
+                        "sales_velocity": float(row[30]) if row[30] is not None else None,
+                        "rank_change_1d": int(row[31]) if row[31] is not None else None,
+                        "rank_change_3d": int(row[32]) if row[32] is not None else None,
+                        "rank_velocity": float(row[33]) if row[33] is not None else None,
+                        "momentum_score": float(row[34]) if row[34] is not None else None,
+                    }
+                    # New Entrant
+                    if row[35] is not None:
+                        new_entrants_map[pid] = bool(row[35])
+        except Exception as e:
+            logger.warning(f"Ürün verileri veritabanından çekilemedi: {e}")
+
+        return product_details, latest_metrics, new_entrants_map
+
+    def _enrich_predictions(
+        self,
+        predictions_df: pd.DataFrame,
+        product_details: dict,
+        latest_metrics: dict,
+        new_entrants_map: dict,
+    ) -> list[dict]:
+        """Tahmin DataFrame'ini zenginleştirilmiş dict listesine çevirir."""
+        results = []
+        for _, row in predictions_df.iterrows():
+            pid = int(row.get("product_id", 0))
+            detail = product_details.get(pid, {})
+            metrics = latest_metrics.get(pid, {})
+
+            # JSONB attributes'tan ek detaylar çıkar
+            attrs = detail.get("attributes") or {}
+            if isinstance(attrs, str):
+                import json as _j
+                try: attrs = _j.loads(attrs)
+                except: attrs = {}
+
+            result = {
+                # Tahmin verileri
+                "product_id":       pid,
+                "trend_label":      str(row.get("trend_label", "")),
+                "trend_score":      float(row.get("trend_score", 0)),
+                "confidence":       float(row.get("confidence", 0)),
+                "ensemble_demand":  float(row.get("ensemble_demand", 0)),
+
+                # Ürün kimlik bilgileri
+                "product_code":     detail.get("product_code"),
+                "name":             detail.get("name"),
+                "brand":            detail.get("brand"),
+                "seller":           detail.get("seller"),
+                "category":         detail.get("category") or str(row.get("category", "")),
+                "category_tag":     detail.get("category_tag"),
+                "url":              detail.get("url"),
+                "image_url":        detail.get("image_url"),
+
+                # Fiyat bilgileri
+                "price":            metrics.get("price") or detail.get("last_price"),
+                "discounted_price": metrics.get("discounted_price"),
+                "discount_rate":    metrics.get("discount_rate") or detail.get("last_discount_rate"),
+
+                # Stil özellikleri
+                "dominant_color":   detail.get("dominant_color"),
+                "fabric_type":      detail.get("fabric_type"),
+                "fit_type":         detail.get("fit_type"),
+                "sizes":            detail.get("sizes"),
+
+                # JSONB ek özellikler — zengin detay
+                "attributes":       attrs,
+                "review_summary":   detail.get("review_summary"),
+
+                # Performans metrikleri
+                "favorite_count":   metrics.get("favorite_count", 0),
+                "cart_count":       metrics.get("cart_count", 0),
+                "view_count":       metrics.get("view_count", 0),
+                "rating_count":     metrics.get("rating_count", 0),
+                "avg_rating":       metrics.get("avg_rating"),
+                "search_rank":      metrics.get("search_rank"),
+                "engagement_score": metrics.get("engagement_score") or detail.get("engagement_score"),
+                "popularity_score": metrics.get("popularity_score"),
+                "sales_velocity":   metrics.get("sales_velocity") or detail.get("avg_sales_velocity"),
+
+                # Rank momentum verileri
+                "rank_change_1d":   metrics.get("rank_change_1d"),
+                "rank_change_3d":   metrics.get("rank_change_3d"),
+                "rank_velocity":    metrics.get("rank_velocity"),
+                "momentum_score":   metrics.get("momentum_score"),
+
+                # Intelligence sinyalleri
+                "is_new_entrant":   new_entrants_map.get(pid, False),
+            }
+            results.append(result)
+
+        return results
 
     def analyze(self, product_id: int) -> dict:
         """
@@ -480,6 +531,12 @@ class IntelligenceService:
                 product_id=product_id
             )
 
+            # Bug 3: State kaydet (feedback penalties güncellenmiş olabilir)
+            try:
+                engine.save_state()
+            except Exception:
+                pass
+
             # Büyük hata → alert üret
             error_pct = abs(sold_quantity - predicted_quantity) / max(predicted_quantity, 1) * 100
             penalty_applied = error_pct > 50
@@ -564,6 +621,65 @@ class IntelligenceService:
         except Exception:
             return 0.0
 
+    def _generate_alerts(self, cat: str, preds: list[dict], cat_heat: float, rising: int, total: int):
+        from db.writer import save_alert
+
+        for p in preds:
+            score = p.get("trend_score", 0)
+            pid = p["product_id"]
+
+            if score > 90:
+                save_alert({
+                    "type":       "rank_spike",
+                    "product_id": pid,
+                    "category":   cat,
+                    "message":    f"Yüksek trend skoru: {score:.1f}",
+                    "extra_data": p,
+                })
+
+            if p.get("is_new_entrant") and score > 80:
+                save_alert({
+                    "type":       "viral_start",
+                    "product_id": pid,
+                    "category":   cat,
+                    "message":    f"Yeni giriş + yüksek skor: {score:.1f}",
+                    "extra_data": p,
+                })
+
+        try:
+            from sqlalchemy import text as _t
+            from db.connection import engine as _dbe
+            with _dbe.connect() as _conn:
+                drop_sql = _t('''
+                    SELECT DISTINCT ON (product_id) product_id, rank_change_3d
+                    FROM daily_metrics
+                    WHERE search_term = :cat
+                      AND recorded_at >= CURRENT_DATE
+                      AND rank_change_3d > 300
+                    ORDER BY product_id, recorded_at DESC
+                    LIMIT 10
+                ''')
+                drops = _conn.execute(drop_sql, {"cat": cat}).fetchall()
+                for drop_row in drops:
+                    save_alert({
+                        "type":       "rank_drop",
+                        "product_id": drop_row[0],
+                        "category":   cat,
+                        "message":    f"3 günde {int(drop_row[1])} sıra kötüleşme",
+                        "extra_data": {"rank_change_3d": float(drop_row[1])},
+                    })
+        except Exception:
+            pass
+
+        if cat_heat > 0.8:
+            save_alert({
+                "type":       "category_heat",
+                "product_id": None,
+                "category":   cat,
+                "message":    f"Kategori ısınıyor: heat={cat_heat:.2f}",
+                "extra_data": {"heat": cat_heat, "rising": rising, "total": total},
+            })
+
     async def nightly_batch(self):
         """
         APScheduler tarafından her gece 02:00'de çalıştırılır.
@@ -576,6 +692,11 @@ class IntelligenceService:
         from db.writer import update_rank_momentum, save_category_signal
 
         logger.info("🌙 Nightly batch başladı")
+
+        # Bug 1: Predict cache'i invalidate et (tüm yeni sonuçlar hesaplanacak)
+        self._predict_cache.clear()
+        self._predict_cache_at.clear()
+
         try:
             # ── 0. Kategori yeniden sınıflandırma ────────────────────────────
             try:
@@ -594,15 +715,45 @@ class IntelligenceService:
             momentum_updated = update_rank_momentum()
             logger.info(f"  Rank momentum: {momentum_updated} ürün güncellendi")
 
-            # ── 2. Kategori scoring ──────────────────────────────────────────
+            # ── 2. Bug 2 Fix: Tüm tahminleri TEK SEFERDE hesapla ────────────
+            # Eski: for cat in categories: predict(cat) → her biri engine.predict() çağırıyordu
+            # Yeni: engine.predict() 1 kez, sonuçları kategoriye göre böl
             categories = get_categories()
             if not categories:
                 logger.warning("Aktif kategori yok, batch atlandı")
                 return
 
+            engine = self._ensure_engine()
+            all_predictions_df = engine.predict()
+
+            if all_predictions_df.empty:
+                logger.warning("Engine tahmin döndürmedi, nightly batch atlanıyor")
+                return
+
+            # Tüm ürünlerin detaylarını tek seferde çek
+            all_product_ids = all_predictions_df["product_id"].unique().tolist()
+            product_details, latest_metrics, new_entrants_map = self._fetch_product_enrichment(all_product_ids)
+
             all_results = []
             for cat in categories:
-                preds = self.predict(category=cat, top_n=500)
+                # Bu kategorinin tahminlerini filtrele
+                if "category" in all_predictions_df.columns:
+                    cat_preds_df = all_predictions_df[
+                        all_predictions_df["category"].str.contains(cat, case=False, na=False)
+                    ]
+                else:
+                    cat_preds_df = pd.DataFrame()
+
+                if cat_preds_df.empty:
+                    continue
+
+                # Top 500
+                if "trend_score" in cat_preds_df.columns:
+                    cat_preds_df = cat_preds_df.nlargest(500, "trend_score")
+                else:
+                    cat_preds_df = cat_preds_df.head(500)
+
+                preds = self._enrich_predictions(cat_preds_df, product_details, latest_metrics, new_entrants_map)
                 all_results.extend(preds)
 
                 if not preds:
@@ -662,70 +813,24 @@ class IntelligenceService:
                     pass  # Opsiyonel — sessizce geç
 
                 # ── 4. Alertler ───────────────────────────────────────────────
-                for p in preds:
-                    score = p.get("trend_score", 0)
-                    pid = p["product_id"]
-
-                    # 4a. Rank spike (mevcut)
-                    if score > 90:
-                        save_alert({
-                            "type":       "rank_spike",
-                            "product_id": pid,
-                            "category":   cat,
-                            "message":    f"Yüksek trend skoru: {score:.1f}",
-                            "extra_data": p,
-                        })
-
-                    # 4b. Viral start — yeni giren + yüksek skor
-                    if p.get("is_new_entrant") and score > 80:
-                        save_alert({
-                            "type":       "viral_start",
-                            "product_id": pid,
-                            "category":   cat,
-                            "message":    f"Yeni giriş + yüksek skor: {score:.1f}",
-                            "extra_data": p,
-                        })
-
-                # 4c. Rank drop — herhangi birinde 3 günlük ciddi kötüleşme
-                try:
-                    from sqlalchemy import text as _t
-                    from db.connection import engine as _dbe
-                    with _dbe.connect() as _conn:
-                        drop_sql = _t("""
-                            SELECT DISTINCT ON (product_id) product_id, rank_change_3d
-                            FROM daily_metrics
-                            WHERE search_term = :cat
-                              AND recorded_at >= CURRENT_DATE
-                              AND rank_change_3d > 300
-                            ORDER BY product_id, recorded_at DESC
-                            LIMIT 10
-                        """)
-                        drops = _conn.execute(drop_sql, {"cat": cat}).fetchall()
-                        for drop_row in drops:
-                            save_alert({
-                                "type":       "rank_drop",
-                                "product_id": drop_row[0],
-                                "category":   cat,
-                                "message":    f"3 günde {int(drop_row[1])} sıra kötüleşme",
-                                "extra_data": {"rank_change_3d": float(drop_row[1])},
-                            })
-                except Exception:
-                    pass  # Opsiyonel — sessizce geç
-
-                # 4d. Category heat alert
-                if cat_heat > 0.8:
-                    save_alert({
-                        "type":       "category_heat",
-                        "product_id": None,
-                        "category":   cat,
-                        "message":    f"Kategori ısınıyor: heat={cat_heat:.2f}",
-                        "extra_data": {"heat": cat_heat, "rising": rising, "total": total},
-                    })
+                self._generate_alerts(cat, preds, cat_heat, rising, total)
 
             logger.info(
                 f"✅ Nightly batch tamamlandı — "
                 f"{len(all_results)} ürün, {len(categories)} kategori"
             )
+
+            # Bug 3: State kaydet
+            try:
+                engine.save_state()
+            except Exception:
+                pass
+
+            # DB'ye tahmin sonuçlarını yaz
+            try:
+                save_predictions(all_results)
+            except Exception as e:
+                logger.warning(f"Nightly tahminler DB'ye yazılamadı: {e}")
 
             # ── Backend'e bildir (fire & forget) ─────────────────────────
             # Frontend'in trend listesini yenileyebilmesi için callback gönder
@@ -807,6 +912,12 @@ class IntelligenceService:
 
             # Modelleri kaydet
             engine.registry.save_all()
+
+            # Bug 3: State kaydet
+            try:
+                engine.save_state()
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error(f"Weekly retraining hatası: {e}", exc_info=True)
