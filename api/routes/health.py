@@ -1,7 +1,7 @@
 # api/routes/health.py
 """GET /health — Servis ve engine sağlık durumu."""
 from fastapi import APIRouter
-from datetime import datetime
+from datetime import datetime, timezone
 
 from db.connection import check_connection
 from services.intelligence_service import intelligence_service
@@ -25,7 +25,7 @@ async def health_check():
 
     return {
         "status":       overall,
-        "timestamp":    datetime.utcnow().isoformat(),
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
         "db_connected": db_ok,
         **engine_status,
     }

@@ -5,7 +5,7 @@ lumora_db'den daily_metrics ve products verilerini Pandas DataFrame olarak çeke
 """
 import logging
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 
 from db.connection import engine
@@ -29,7 +29,7 @@ def get_daily_metrics(
     Returns:
         DataFrame: engine.predictor.train() uyumlu format
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     conditions = ["dm.recorded_at >= :cutoff"]
     params: dict = {"cutoff": cutoff}

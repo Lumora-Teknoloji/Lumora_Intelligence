@@ -6,7 +6,7 @@ PredictionEngine'i uygulama ömrü boyunca tek instance olarak tutar.
 DB'den veri okur, tahmin yapar, feedback işler.
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -62,7 +62,7 @@ class IntelligenceService:
             df = self._normalize_df(df)
             self._engine = PredictionEngine(use_prophet=False, use_clip=False)
             self._engine.train(df, verbose=False)
-            self._trained_at = datetime.utcnow()
+            self._trained_at = datetime.now(timezone.utc)
             self._train_data_rows = len(df)
             logger.info(
                 f"✅ Engine eğitildi — {len(df)} satır, "
@@ -489,7 +489,7 @@ class IntelligenceService:
 
             engine = self._ensure_engine()
             engine.train(df, verbose=False)
-            self._trained_at = datetime.utcnow()
+            self._trained_at = datetime.now(timezone.utc)
             self._train_data_rows = len(df)
 
             logger.info(f"✅ Retraining tamamlandı — {len(df)} satır, {data_days} günlük veri")
