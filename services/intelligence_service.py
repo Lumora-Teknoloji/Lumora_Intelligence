@@ -461,9 +461,8 @@ class IntelligenceService:
             except Exception as e:
                 logger.debug(f"Backend callback gönderilemedi (normal): {e}")
 
-        # async context içinde threading kullan — blocking IO olmasın
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _post)
+        # asyncio.to_thread — Python 3.9+ modern pattern (get_event_loop deprecation fix)
+        await asyncio.to_thread(_post)
 
 
     async def weekly_retrain(self):
