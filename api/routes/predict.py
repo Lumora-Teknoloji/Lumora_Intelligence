@@ -8,6 +8,11 @@ from services.intelligence_service import intelligence_service
 router = APIRouter()
 
 
+import time
+
+_predict_cache = {}
+CACHE_TTL = 900  # 15 dakika
+
 @router.get("/predict", tags=["Prediction"])
 async def predict(
     category: Optional[str] = Query(None, description="Filtre kategori (search_term)"),
@@ -21,11 +26,26 @@ async def predict(
 
     Her ürün için: `product_id`, `trend_label`, `trend_score`, `confidence`
     """
-    # Softly clamp — 422 yerine clamp et (istemci çökmez)
     top_n = min(top_n, 1000)
+    
+    # Cache lookup
+    cache_key = f"{category}_{top_n}"
+    now = time.time()
+    if cache_key in _predict_cache:
+        cached_data, timestamp = _predict_cache[cache_key]
+        if now - timestamp < CACHE_TTL:
+            return cached_data
+
+    # Cache miss
     results = intelligence_service.predict(category=category, top_n=top_n)
-    return {
+    
+    response = {
         "count":    len(results),
         "category": category,
         "results":  results,
     }
+    
+    # Save to cache
+    _predict_cache[cache_key] = (response, now)
+    
+    return response

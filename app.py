@@ -79,7 +79,8 @@ async def verify_internal_key(request: Request, call_next):
 
     key = request.headers.get("X-Internal-Key", "")
     if key != config.INTERNAL_API_KEY:
-        raise HTTPException(status_code=401, detail="Geçersiz iç API anahtarı")
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=401, content={"detail": "Geçersiz iç API anahtarı"})
 
     return await call_next(request)
 
